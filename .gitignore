@@ -1,5 +1,4 @@
 testdata/
-*_test.go
 *.pcap
 .DS_Store
 *.log
