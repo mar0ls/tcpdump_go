@@ -1,0 +1,7 @@
+testdata/
+*_test.go
+*.pcap
+.DS_Store
+*.log
+bench_sniff.sh
+generate_docs.py
