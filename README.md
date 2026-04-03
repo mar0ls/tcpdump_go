@@ -322,7 +322,6 @@ Effect is temporary — resets on reboot. macOS captures before offloading — f
 
 ```bash
 sudo ./tcpdump_go -i eth0 2>/dev/null          # packets only
-sudo ./tcpdump_go -i eth0 > packets.txt        # packets to file
-sudo ./tcpdump_go -i eth0 > pkts.txt 2> err.log
+sudo ./tcpdump_go -i eth0 > packets.log        # packets to file
+sudo ./tcpdump_go -i eth0 > packets.log 2> errors.log
 ```
-
