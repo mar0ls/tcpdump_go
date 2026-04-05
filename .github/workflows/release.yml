@@ -9,7 +9,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -22,13 +22,15 @@ jobs:
             output: tcpdump_go-macos-arm64
 
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.25'
 
       - name: Install libpcap (Linux)
         if: runner.os == 'Linux'
@@ -37,6 +39,10 @@ jobs:
       - name: Install libpcap (macOS)
         if: runner.os == 'macOS'
         run: brew install libpcap
+
+      - name: Test
+        if: runner.os == 'Linux'
+        run: go test -race ./...
 
       - name: Build
         run: |
@@ -52,6 +58,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4
