@@ -1,0 +1,44 @@
+# Documentation: {{.Module}}
+
+> commit: {{.GitRev}} · Go {{.GoVersion}}
+
+---
+
+## CLI flags
+
+```
+{{.Flags}}
+```
+
+## Packages
+
+{{range .Packages}}
+### `{{.Name}}`
+
+```
+{{.Doc}}
+```
+{{end}}
+
+## Platform-specific files
+
+| File | Build tag | Description |
+|------|-----------|-------------|
+{{- range .PlatformFiles}}
+| `{{.File}}` | `{{.Tag}}` | {{.Desc}} |
+{{- end}}
+
+## Dependencies
+
+```
+{{.Deps}}
+```
+
+## Code metrics
+
+| Metric | Value |
+|--------|-------|
+| .go files | {{.Metrics.Files}} |
+| Total lines | {{.Metrics.Total}} |
+| Code lines | {{.Metrics.Code}} |
+| Comment lines | {{.Metrics.Comments}} |

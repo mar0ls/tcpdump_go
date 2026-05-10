@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 func buildTCPPkt(srcIP, dstIP string, srcPort, dstPort uint16, syn, ack bool) gopacket.Packet {
@@ -87,8 +87,8 @@ func TestUpdate_TCP(t *testing.T) {
 	if s.TCP != 1 {
 		t.Errorf("TCP = %d", s.TCP)
 	}
-	if s.TcpSYN != 1 {
-		t.Errorf("TcpSYN = %d", s.TcpSYN)
+	if s.TCPSYN != 1 {
+		t.Errorf("TCPSYN = %d", s.TCPSYN)
 	}
 	if s.Bytes == 0 {
 		t.Error("Bytes = 0")
@@ -140,14 +140,14 @@ func TestUpdate_TCPFlags(t *testing.T) {
 	s.Update(buildTCPPktFlags("1.1.1.1", "2.2.2.2", 1, 2, true, false, false, false))
 	s.Update(buildTCPPktFlags("1.1.1.1", "2.2.2.2", 1, 2, false, true, true, false))
 	s.Update(buildTCPPktFlags("1.1.1.1", "2.2.2.2", 1, 2, false, false, false, true))
-	if s.TcpSYN != 1 {
-		t.Errorf("TcpSYN = %d", s.TcpSYN)
+	if s.TCPSYN != 1 {
+		t.Errorf("TCPSYN = %d", s.TCPSYN)
 	}
-	if s.TcpFIN != 1 {
-		t.Errorf("TcpFIN = %d", s.TcpFIN)
+	if s.TCPFIN != 1 {
+		t.Errorf("TCPFIN = %d", s.TCPFIN)
 	}
-	if s.TcpRST != 1 {
-		t.Errorf("TcpRST = %d", s.TcpRST)
+	if s.TCPRST != 1 {
+		t.Errorf("TCPRST = %d", s.TCPRST)
 	}
 }
 

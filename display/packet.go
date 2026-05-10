@@ -6,21 +6,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
-// FormatTS formats a packet timestamp according to mode:
-// "t" = none, "tt" = unix epoch, "ttt" = delta from prevTS, "tttt" = date+time,
-// default = HH:MM:SS.micros.
-func FormatTS(ts, prevTS time.Time, mode string) string {
+// FormatTS formats a packet timestamp according to mode.
+func FormatTS(ts, prevTS time.Time, mode TSMode) string {
 	switch mode {
-	case "t":
+	case TSNone:
 		return ""
-	case "tt":
+	case TSUnix:
 		us := ts.UnixMicro()
 		return Colorize(fmt.Sprintf("%d.%06d", us/1e6, us%1e6), ColorGray)
-	case "ttt":
+	case TSDelta:
 		if prevTS.IsZero() {
 			return Colorize("0.000000", ColorGray)
 		}
@@ -31,51 +29,49 @@ func FormatTS(ts, prevTS time.Time, mode string) string {
 			us = -us
 		}
 		return Colorize(fmt.Sprintf("%d.%06d", sec, us), ColorGray)
-	case "tttt":
+	case TSDateTime:
 		return Colorize(ts.Format("2006-01-02 15:04:05.000000"), ColorGray)
 	default:
 		return Colorize(ts.Format("15:04:05.000000"), ColorGray)
 	}
 }
 
-// PrintPacket dispatches packet rendering to the appropriate sub-printer
-// based on viewMode ("normal", "verbose", "hex", "hexascii", "hex_link", "hexascii_link").
-func PrintPacket(num uint64, packet gopacket.Packet, ts, prevTS time.Time, viewMode, tsMode string, verbose, disableDNS bool) {
+// PrintPacket dispatches packet rendering based on viewMode and tsMode.
+func PrintPacket(num uint64, packet gopacket.Packet, ts, prevTS time.Time, viewMode ViewMode, tsMode TSMode, verbose, disableDNS bool) {
 	tsStr := FormatTS(ts, prevTS, tsMode)
 	switch viewMode {
-	case "hex", "hexascii":
+	case ViewHex, ViewHexASCII:
 		if verbose {
 			PrintVerbose(num, packet, tsStr, disableDNS)
 		} else {
 			PrintNormal(num, packet, tsStr, disableDNS)
 		}
 		data := PacketPayload(packet)
-		if viewMode == "hex" {
+		if viewMode == ViewHex {
 			PrintHex(data)
 		} else {
 			PrintHexASCII(data)
 		}
-	case "hex_link", "hexascii_link":
+	case ViewHexLink, ViewHexASCIILink:
 		if verbose {
 			PrintVerbose(num, packet, tsStr, disableDNS)
 		} else {
 			PrintNormal(num, packet, tsStr, disableDNS)
 		}
 		data := packet.Data()
-		if viewMode == "hex_link" {
+		if viewMode == ViewHexLink {
 			PrintHex(data)
 		} else {
 			PrintHexASCII(data)
 		}
-	case "verbose":
+	case ViewVerbose:
 		PrintVerbose(num, packet, tsStr, disableDNS)
 	default:
 		PrintNormal(num, packet, tsStr, disableDNS)
 	}
 }
 
-// PrintVerbose prints a detailed one- or two-line packet summary (tcpdump -v style)
-// with IP metadata, TCP flags, sequence numbers, and options.
+// PrintVerbose prints the -v style packet header (IP metadata, TCP flags, options).
 func PrintVerbose(num uint64, packet gopacket.Packet, tsStr string, disableDNS bool) {
 	numStr := Colorize(fmt.Sprintf("#%-6d", num), ColorGray)
 	nl := packet.NetworkLayer()
@@ -123,19 +119,19 @@ func PrintVerbose(num uint64, packet gopacket.Packet, tsStr string, disableDNS b
 	tl := packet.TransportLayer()
 	if tl == nil {
 		Outf("%s %s %s %s\n    %s > %s: length %d\n",
-			numStr, tsStr, Colorize(IpLayerName(nl), ColorYellow), ipMeta,
+			numStr, tsStr, Colorize(IPLayerName(nl), ColorYellow), ipMeta,
 			Colorize(srcStr, ColorGreen), Colorize(dstStr, ColorRed),
 			len(packet.Data()))
 		return
 	}
 	sport, dport := ExtractPorts(tl)
-	ipProtoStr := Colorize(IpLayerName(nl), ColorYellow)
+	ipProtoStr := Colorize(IPLayerName(nl), ColorYellow)
 	payloadLen := len(tl.LayerPayload())
 	switch tcp := tl.(type) {
 	case *layers.TCP:
-		flags := Colorize("["+TcpFlagsShort(tcp)+"]", ColorYellow)
+		flags := Colorize("["+TCPFlagsShort(tcp)+"]", ColorYellow)
 		seqEnd := tcp.Seq + uint32(payloadLen) //nolint:gosec // payloadLen is capped by pcap snaplen
-		opts := TcpOptionsStr(tcp)
+		opts := TCPOptionsStr(tcp)
 		if opts != "" {
 			opts = ", options [" + opts + "]"
 		}
@@ -158,8 +154,8 @@ func PrintVerbose(num uint64, packet gopacket.Packet, tsStr string, disableDNS b
 	}
 }
 
-// TcpFlagsShort returns an abbreviated TCP flag string, e.g. "SA", "F", "R".
-func TcpFlagsShort(tcp *layers.TCP) string {
+// TCPFlagsShort returns an abbreviated TCP flag string, e.g. "SA", "F", "R".
+func TCPFlagsShort(tcp *layers.TCP) string {
 	var b strings.Builder
 	if tcp.SYN {
 		b.WriteByte('S')
@@ -185,9 +181,8 @@ func TcpFlagsShort(tcp *layers.TCP) string {
 	return b.String()
 }
 
-// TcpOptionsStr returns a comma-separated string of TCP options (MSS, timestamps,
-// window scale, SACK). Unknown option kinds are rendered as "opt-N".
-func TcpOptionsStr(tcp *layers.TCP) string {
+// TCPOptionsStr formats TCP options as a comma-separated string; unknown kinds render as "opt-N".
+func TCPOptionsStr(tcp *layers.TCP) string {
 	if len(tcp.Options) == 0 {
 		return ""
 	}
@@ -270,7 +265,7 @@ func PrintNormal(num uint64, packet gopacket.Packet, tsStr string, disableDNS bo
 		srcStr = ResolveIP(srcStr)
 		dstStr = ResolveIP(dstStr)
 	}
-	proto := Colorize(IpLayerName(nl), ColorYellow)
+	proto := Colorize(IPLayerName(nl), ColorYellow)
 	if tl == nil {
 		Outf("%s %s %s %s > %s: length %d\n", numStr, tsStr, proto,
 			Colorize(srcStr, ColorGreen), Colorize(dstStr, ColorRed),
@@ -282,7 +277,7 @@ func PrintNormal(num uint64, packet gopacket.Packet, tsStr string, disableDNS bo
 	payloadLen := len(tl.LayerPayload())
 	switch tcp := tl.(type) {
 	case *layers.TCP:
-		flags := Colorize("["+TcpFlagsShort(tcp)+"]", ColorYellow)
+		flags := Colorize("["+TCPFlagsShort(tcp)+"]", ColorYellow)
 		Outf("%s %s %s  %s.%s > %s.%s: Flags %s, seq %d, ack %d, win %d, length %d\n",
 			numStr, tsStr, protoStr,
 			Colorize(srcStr, ColorGreen), Colorize(sport, ColorCyan),
@@ -297,8 +292,8 @@ func PrintNormal(num uint64, packet gopacket.Packet, tsStr string, disableDNS bo
 	}
 }
 
-// IpLayerName returns "IP", "IP6", or the raw layer type string for nl.
-func IpLayerName(nl gopacket.NetworkLayer) string {
+// IPLayerName returns "IP", "IP6", or the raw layer type string for nl.
+func IPLayerName(nl gopacket.NetworkLayer) string {
 	switch nl.LayerType() {
 	case layers.LayerTypeIPv4:
 		return "IP"
@@ -309,8 +304,7 @@ func IpLayerName(nl gopacket.NetworkLayer) string {
 	}
 }
 
-// ExtractPorts returns the source and destination port strings for a TCP or
-// UDP transport layer. Returns empty strings for other layer types.
+// ExtractPorts returns src/dst port strings for TCP/UDP; empty for other layers.
 func ExtractPorts(tl gopacket.TransportLayer) (sport, dport string) {
 	switch t := tl.(type) {
 	case *layers.TCP:
@@ -321,8 +315,7 @@ func ExtractPorts(tl gopacket.TransportLayer) (sport, dport string) {
 	return "", ""
 }
 
-// ExtractTransportInfo returns the protocol name, source port, and destination
-// port for a packet. Used to build flow keys for CSV export.
+// ExtractTransportInfo returns proto name + src/dst ports for the packet's transport layer.
 func ExtractTransportInfo(packet gopacket.Packet) (proto, sport, dport string) {
 	tl := packet.TransportLayer()
 	if tl == nil {

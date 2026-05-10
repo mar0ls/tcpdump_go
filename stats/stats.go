@@ -10,8 +10,8 @@ import (
 	"tcpdump_go/display"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 // Stats holds per-session capture counters and histograms.
@@ -35,9 +35,9 @@ type Stats struct {
 	MaxSize uint64
 	SumSize uint64
 
-	TcpSYN uint64
-	TcpFIN uint64
-	TcpRST uint64
+	TCPSYN uint64
+	TCPFIN uint64
+	TCPRST uint64
 
 	FirstPkt time.Time
 	LastPkt  time.Time
@@ -46,7 +46,7 @@ type Stats struct {
 	DstPortCount map[string]uint64
 }
 
-// NewStats returns a zero-initialised Stats with the map fields allocated.
+// NewStats returns a zeroed Stats ready for use.
 func NewStats() *Stats {
 	return &Stats{
 		SrcIPCount:   make(map[string]uint64),
@@ -54,8 +54,7 @@ func NewStats() *Stats {
 	}
 }
 
-// Update extracts layer information from packet and increments the appropriate
-// counters. Must not be called concurrently.
+// Update increments counters from packet. Not goroutine-safe.
 func (s *Stats) Update(packet gopacket.Packet) {
 	s.Total++
 	size := uint64(len(packet.Data()))
@@ -106,13 +105,13 @@ func (s *Stats) Update(packet gopacket.Packet) {
 		tcp, _ := tl.(*layers.TCP)
 		if tcp != nil {
 			if tcp.SYN {
-				s.TcpSYN++
+				s.TCPSYN++
 			}
 			if tcp.FIN {
-				s.TcpFIN++
+				s.TCPFIN++
 			}
 			if tcp.RST {
-				s.TcpRST++
+				s.TCPRST++
 			}
 			s.DstPortCount[fmt.Sprintf("%d", tcp.DstPort)]++
 		}
@@ -139,8 +138,7 @@ func Pct(part, total uint64) string {
 	return fmt.Sprintf("%.1f%%", float64(part)/float64(total)*100)
 }
 
-// TopN returns the n keys from m with the highest values, formatted as
-// "key                 count" (left-padded to 20 chars).
+// TopN returns the top n entries from m, sorted by value descending.
 func TopN(m map[string]uint64, n int) []string {
 	type kv struct {
 		key string
@@ -160,8 +158,7 @@ func TopN(m map[string]uint64, n int) []string {
 	return result
 }
 
-// Print writes the full session summary (duration, packet counts, protocol
-// breakdown, top senders, top destination ports) to the buffered output.
+// Print writes the session summary to buffered output.
 func (s *Stats) Print() {
 	dur := s.LastPkt.Sub(s.FirstPkt)
 	durStr := dur.Round(time.Millisecond).String()
@@ -220,7 +217,7 @@ func (s *Stats) Print() {
 	}
 	if s.TCP > 0 {
 		hdr("TCP flags")
-		display.Outf("  SYN: %d  FIN: %d  RST: %d\n", s.TcpSYN, s.TcpFIN, s.TcpRST)
+		display.Outf("  SYN: %d  FIN: %d  RST: %d\n", s.TCPSYN, s.TCPFIN, s.TCPRST)
 	}
 	if len(s.SrcIPCount) > 0 {
 		hdr("Top 5 senders")

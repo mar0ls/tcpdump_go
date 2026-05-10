@@ -3,7 +3,7 @@ package display
 import (
 	"sync"
 
-	"github.com/google/gopacket"
+	"github.com/gopacket/gopacket"
 )
 
 const hexTable = "0123456789abcdef"
@@ -15,7 +15,7 @@ var hexBufPool = sync.Pool{
 	},
 }
 
-// AppendOffset appends a 4-digit zero-padded hex offset to buf and returns the result.
+// AppendOffset appends a 4-digit hex offset to buf.
 func AppendOffset(buf []byte, i int) []byte {
 	return append(buf,
 		hexTable[(i>>12)&0xf],
@@ -25,8 +25,7 @@ func AppendOffset(buf []byte, i int) []byte {
 	)
 }
 
-// PrintHex prints data as a hex dump (without ASCII column) to Out.
-// Each row shows a 4-hex-digit offset followed by up to 16 bytes in hex.
+// PrintHex prints data as a hex dump (-x style) to Out.
 func PrintHex(data []byte) {
 	bufPtr := hexBufPool.Get().(*[]byte)
 	for i := 0; i < len(data); i += 16 {
@@ -50,8 +49,7 @@ func PrintHex(data []byte) {
 	hexBufPool.Put(bufPtr)
 }
 
-// PrintHexASCII prints data as a hex+ASCII dump to Out (tcpdump -X style).
-// Each row shows offset, hex bytes, and a printable-ASCII column.
+// PrintHexASCII prints data as hex+ASCII (-X style) to Out.
 func PrintHexASCII(data []byte) {
 	bufPtr := hexBufPool.Get().(*[]byte)
 	for i := 0; i < len(data); i += 16 {
@@ -92,9 +90,7 @@ func PrintHexASCII(data []byte) {
 	hexBufPool.Put(bufPtr)
 }
 
-// PacketPayload returns the packet bytes above the link layer (i.e. the
-// network layer and above). Falls back to the full raw data if no link layer
-// is present.
+// PacketPayload returns packet data above the link layer.
 func PacketPayload(packet gopacket.Packet) []byte {
 	if ll := packet.LinkLayer(); ll != nil {
 		return ll.LayerPayload()

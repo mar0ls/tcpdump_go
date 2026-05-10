@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// Out is the buffered stdout writer (256 KB). Batches small writes into a single syscall.
+// Out is the buffered stdout writer (256 KB).
 var Out = bufio.NewWriterSize(os.Stdout, 256*1024)
 
 // UseColor controls whether output includes ANSI escape codes.
@@ -34,26 +34,24 @@ const (
 	ColorGray   = "\033[90m"
 )
 
-// FlushOut flushes the buffered stdout writer. Call after writing a logical
-// batch of output to avoid stale data in the buffer.
+// FlushOut flushes the buffered stdout writer.
 func FlushOut() {
 	if err := Out.Flush(); err != nil {
 		log.Printf("flush stdout: %v", err)
 	}
 }
 
-// Outf writes a formatted string to the buffered stdout writer.
+// Outf writes a formatted string to Out.
 func Outf(format string, args ...any) {
 	_, _ = fmt.Fprintf(Out, format, args...)
 }
 
-// Outln writes args followed by a newline to the buffered stdout writer.
+// Outln writes args followed by a newline to Out.
 func Outln(args ...any) {
 	_, _ = fmt.Fprintln(Out, args...)
 }
 
-// Colorize wraps s in the given ANSI color code. Returns s unchanged when
-// UseColor is false (e.g. stdout is not a terminal).
+// Colorize wraps s in the given ANSI color code; no-op when UseColor is false.
 func Colorize(s, color string) string {
 	if !UseColor {
 		return s
@@ -63,8 +61,7 @@ func Colorize(s, color string) string {
 
 var dnsCache sync.Map
 
-// ResolveIP performs a reverse DNS lookup for ip and caches the result.
-// Returns the original IP string on failure or when no PTR record exists.
+// ResolveIP does a reverse DNS lookup for ip, caching results.
 func ResolveIP(ip string) string {
 	if v, ok := dnsCache.Load(ip); ok {
 		return v.(string)
@@ -82,8 +79,7 @@ func ClearDNSCache(ip string) {
 	dnsCache.Delete(ip)
 }
 
-// CaptureOut redirects Out to an in-memory buffer and returns the buffer and
-// a restore function. Used in tests to capture printed output.
+// CaptureOut redirects Out to an in-memory buffer; returns the buffer and a restore function.
 func CaptureOut() (*bytes.Buffer, func()) {
 	buf := &bytes.Buffer{}
 	old := Out

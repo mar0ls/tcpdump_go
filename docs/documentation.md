@@ -1,13 +1,11 @@
 # Documentation: tcpdump_go
-> Generated: 2026-04-03 21:15:22 · commit: n/a · Go 1.25.0
+
+> commit: 70bc83c · Go 1.25.0
 
 ---
-## Package description
-tcpdump_go — network packet analyzer built on libpcap and gopacket. Supports
-live capture, pcap/pcapng file reading, BPF filters, file rotation, flow CSV
-export, and colorized output. Requires root or CAP_NET_RAW.
 
 ## CLI flags
+
 ```
 Usage: tcpdump_go [options] [BPF expression]
 
@@ -48,11 +46,12 @@ Misc:
   -q              Quiet mode — print only statistics (requires -stats)
 ```
 
-## Sub-packages
+## Packages
+
 
 ### `capture`
 
-```go
+```
 package capture // import "tcpdump_go/capture"
 
 Package capture handles live network packet capture via libpcap: opening
@@ -76,25 +75,37 @@ func OpenHandle(iface string, snaplen, bufSize uint32, promisc bool) *pcap.Handl
 func PrintInterfaces()
     PrintInterfaces lists all network interfaces available to libpcap and exits.
 
-func RunCapture(
-	iface, filter, outPcap string,
-	snaplen, bufSize uint32,
-	promisc bool,
-	rotateSize, rotateTime uint64,
-	viewMode, tsMode string,
-	verbose, disableDNS, showStats, quiet bool,
-	count uint64,
-	disableOffload bool,
-)
-    RunCapture starts a live packet capture on iface and processes packets until
-    Ctrl+C (or SIGTERM), or until count packets have been seen (0 = unlimited).
-    Captured packets are decoded, optionally written to outPcap, and displayed
-    according to viewMode/tsMode. Statistics are printed if showStats is true.
+func RunCapture(cfg CaptureConfig)
+    RunCapture starts a live packet capture and processes packets until Ctrl+C /
+    SIGTERM, or until cfg.Count packets have been seen (0 = unlimited).
+
+
+TYPES
+
+type CaptureConfig struct {
+	Iface          string
+	Filter         string
+	OutPcap        string
+	Snaplen        uint32
+	BufSize        uint32
+	Promisc        bool
+	RotateSize     uint64
+	RotateTime     uint64
+	ViewMode       display.ViewMode
+	TSMode         display.TSMode
+	Verbose        bool
+	DisableDNS     bool
+	ShowStats      bool
+	Quiet          bool
+	Count          uint64
+	DisableOffload bool
+}
+    CaptureConfig holds all parameters for a live packet capture session.
 ```
 
 ### `display`
 
-```go
+```
 package display // import "tcpdump_go/display"
 
 Package display provides packet formatting and output utilities: ANSI colors,
@@ -152,10 +163,8 @@ func FlushOut()
     FlushOut flushes the buffered stdout writer. Call after writing a logical
     batch of output to avoid stale data in the buffer.
 
-func FormatTS(ts, prevTS time.Time, mode string) string
-    FormatTS formats a packet timestamp according to mode: "t" = none,
-    "tt" = unix epoch, "ttt" = delta from prevTS, "tttt" = date+time, default =
-    HH:MM:SS.micros.
+func FormatTS(ts, prevTS time.Time, mode TSMode) string
+    FormatTS formats a packet timestamp according to mode.
 
 func IpLayerName(nl gopacket.NetworkLayer) string
     IpLayerName returns "IP", "IP6", or the raw layer type string for nl.
@@ -183,10 +192,8 @@ func PrintNormal(num uint64, packet gopacket.Packet, tsStr string, disableDNS bo
     PrintNormal prints a compact one-line packet summary (default tcpdump
     style).
 
-func PrintPacket(num uint64, packet gopacket.Packet, ts, prevTS time.Time, viewMode, tsMode string, verbose, disableDNS bool)
-    PrintPacket dispatches packet rendering to the appropriate sub-printer
-    based on viewMode ("normal", "verbose", "hex", "hexascii", "hex_link",
-    "hexascii_link").
+func PrintPacket(num uint64, packet gopacket.Packet, ts, prevTS time.Time, viewMode ViewMode, tsMode TSMode, verbose, disableDNS bool)
+    PrintPacket dispatches packet rendering based on viewMode and tsMode.
 
 func PrintVerbose(num uint64, packet gopacket.Packet, tsStr string, disableDNS bool)
     PrintVerbose prints a detailed one- or two-line packet summary (tcpdump -v
@@ -203,11 +210,36 @@ func TcpOptionsStr(tcp *layers.TCP) string
     TcpOptionsStr returns a comma-separated string of TCP options (MSS,
     timestamps, window scale, SACK). Unknown option kinds are rendered as
     "opt-N".
+
+
+TYPES
+
+type TSMode uint8
+    TSMode controls how the packet timestamp is rendered.
+
+const (
+	TSDefault  TSMode = iota // HH:MM:SS.micros
+	TSNone                   // -t
+	TSUnix                   // -tt
+	TSDelta                  // -ttt
+	TSDateTime               // -tttt
+)
+type ViewMode uint8
+    ViewMode controls the format used when printing a packet.
+
+const (
+	ViewNormal       ViewMode = iota // default one-line summary
+	ViewVerbose                      // -v
+	ViewHex                          // -x
+	ViewHexASCII                     // -X
+	ViewHexLink                      // -xx
+	ViewHexASCIILink                 // -XX
+)
 ```
 
 ### `rotation`
 
-```go
+```
 package rotation // import "tcpdump_go/rotation"
 
 Package rotation implements pcap file writing with size- and time-based rotation
@@ -246,7 +278,7 @@ func (pw *PcapWriter) WritePacket(ts time.Time, data []byte)
 
 ### `stats`
 
-```go
+```
 package stats // import "tcpdump_go/stats"
 
 Package stats collects and prints capture session statistics: protocol counters,
@@ -308,24 +340,34 @@ func (s *Stats) Update(packet gopacket.Packet)
     counters. Must not be called concurrently.
 ```
 
+
+## Platform-specific files
+
+| File | Build tag | Description |
+|------|-----------|-------------|
+| `signals_unix.go` | `!windows` | ShutdownSignals lists the OS signals that trigger a graceful capture shutdown. |
+| `signals_windows.go` | `windows` | ShutdownSignals lists the OS signals that trigger a graceful capture shutdown. |
+| `offload_linux.go` | `linux` | — |
+| `offload_other.go` | `!linux` | — |
+
 ## Dependencies
+
 ```
-github.com/google/gopacket v1.1.19
-golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550
-golang.org/x/lint v0.0.0-20200302205851-738671d3881b
-golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee
-golang.org/x/net v0.0.0-20190620200207-3b0461eec859
-golang.org/x/sync v0.0.0-20190423024810-112230192c58
-golang.org/x/sys v0.0.0-20190412213103-97732733099d
-golang.org/x/text v0.3.0
-golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7
-golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898
+github.com/gopacket/gopacket v1.5.0
+github.com/vishvananda/netlink v1.1.0
+github.com/vishvananda/netns v0.0.0-20211101163701-50045581ed74
+golang.org/x/crypto v0.37.0
+golang.org/x/net v0.39.0
+golang.org/x/sys v0.32.0
+golang.org/x/term v0.31.0
+golang.org/x/text v0.24.0
 ```
 
 ## Code metrics
+
 | Metric | Value |
 |--------|-------|
-| .go files | 16 |
-| Total lines | 3521 |
-| Code lines | 2974 |
-| Comment lines | 200 |
+| .go files | 18 |
+| Total lines | 3844 |
+| Code lines | 3253 |
+| Comment lines | 201 |

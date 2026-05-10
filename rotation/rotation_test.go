@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 func TestNewPcapWriter(t *testing.T) {
@@ -97,7 +97,7 @@ func TestWritePacket(t *testing.T) {
 	}
 }
 
-func TestWritePacket_EmptyBase(t *testing.T) {
+func TestWritePacket_EmptyBase(_ *testing.T) {
 	pw := NewPcapWriter("", 65535, layers.LinkTypeEthernet, 0, 0)
 	pw.Open()
 	pw.WritePacket(time.Now(), []byte{42})
