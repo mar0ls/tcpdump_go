@@ -10,14 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
-// PcapWriter writes packets to a pcap file with optional size- and time-based
-// rotation. When rotation triggers, the current file is closed and a new one
-// is opened with a numeric suffix (e.g. capture_001.pcap).
+// PcapWriter writes packets to a pcap file with optional size- and time-based rotation.
 type PcapWriter struct {
 	baseFile   string
 	snaplen    uint32
@@ -33,9 +31,7 @@ type PcapWriter struct {
 	fileIdx      int
 }
 
-// NewPcapWriter creates a PcapWriter for baseFile. rotateSize triggers rotation
-// after that many bytes (0 = disabled); rotateTime triggers rotation after that
-// many seconds (0 = disabled). Call Open before writing any packets.
+// NewPcapWriter creates a PcapWriter; rotation by size (bytes) or time (seconds), 0 disables each.
 func NewPcapWriter(baseFile string, snaplen uint32, lt layers.LinkType, rotateSize, rotateTime uint64) *PcapWriter {
 	return &PcapWriter{
 		baseFile:   baseFile,
@@ -46,8 +42,7 @@ func NewPcapWriter(baseFile string, snaplen uint32, lt layers.LinkType, rotateSi
 	}
 }
 
-// Filename returns the path of the current output file. For the first segment
-// it returns baseFile unchanged; subsequent segments get a _NNN suffix.
+// Filename returns the current file path (_NNN suffix for rotated segments).
 func (pw *PcapWriter) Filename() string {
 	if pw.fileIdx == 0 {
 		return pw.baseFile
@@ -59,8 +54,7 @@ func (pw *PcapWriter) Filename() string {
 	return fmt.Sprintf("%s_%03d", pw.baseFile, pw.fileIdx)
 }
 
-// Open creates the current output file and writes the pcap global header.
-// It is a no-op when baseFile is empty.
+// Open creates the output file and writes the pcap header; no-op when baseFile is empty.
 func (pw *PcapWriter) Open() {
 	if pw.baseFile == "" {
 		return
@@ -97,8 +91,7 @@ func (pw *PcapWriter) Close() {
 	}
 }
 
-// WritePacket appends a packet to the current output file, rotating if
-// the configured size or time limit has been reached.
+// WritePacket appends a packet, rotating the file if size or time limits are reached.
 func (pw *PcapWriter) WritePacket(ts time.Time, data []byte) {
 	if pw.writer == nil {
 		return

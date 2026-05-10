@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // TestMain creates test fixtures and builds the test binary before running the entire suite.
@@ -232,14 +232,14 @@ func TestWriteCSV(t *testing.T) {
 func TestRunReadPcap_Normal(_ *testing.T) {
 	_, restore := display.CaptureOut()
 	defer restore()
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", false, true, false, false, "", 0)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, "", 0)
 }
 
 func TestRunReadPcap_WithStats(t *testing.T) {
 	buf, restore := display.CaptureOut()
 	defer restore()
 
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", false, true, true, false, "", 0)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, true, false, "", 0)
 	display.FlushOut()
 
 	output := buf.String()
@@ -270,12 +270,22 @@ func TestRunReadPcap_WithCount(t *testing.T) {
 }
 
 func TestRunReadPcap_AllViewModes(t *testing.T) {
-	modes := []string{"normal", "verbose", "hex", "hexascii", "hex_link", "hexascii_link"}
-	for _, mode := range modes {
-		t.Run(mode, func(_ *testing.T) {
+	modes := []struct {
+		name string
+		mode display.ViewMode
+	}{
+		{"normal", display.ViewNormal},
+		{"verbose", display.ViewVerbose},
+		{"hex", display.ViewHex},
+		{"hexascii", display.ViewHexASCII},
+		{"hex_link", display.ViewHexLink},
+		{"hexascii_link", display.ViewHexASCIILink},
+	}
+	for _, m := range modes {
+		t.Run(m.name, func(_ *testing.T) {
 			_, restore := display.CaptureOut()
 			defer restore()
-			runReadPcap("testdata/test.pcap", "", "", mode, "default", false, true, false, false, "", 0)
+			runReadPcap("testdata/test.pcap", "", "", m.mode, display.TSDefault, false, true, false, false, "", 0)
 		})
 	}
 }
@@ -285,7 +295,7 @@ func TestRunReadPcap_WithCSV(t *testing.T) {
 	_, restore := display.CaptureOut()
 	defer restore()
 
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", false, true, false, false, csvPath, 0)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, csvPath, 0)
 
 	if _, err := os.Stat(csvPath); err != nil {
 		t.Errorf("CSV file not created: %v", err)
@@ -296,7 +306,7 @@ func TestRunReadPcap_DisableDNS(t *testing.T) {
 	buf, restore := display.CaptureOut()
 	defer restore()
 
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", true, true, false, false, "", 0)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, true, true, false, false, "", 0)
 	display.FlushOut()
 
 	out := buf.String()
@@ -309,7 +319,7 @@ func TestRunReadPcap_Quiet(t *testing.T) {
 	buf, restore := display.CaptureOut()
 	defer restore()
 
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", false, true, false, true, "", 0)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, true, "", 0)
 	display.FlushOut()
 
 	if buf.Len() != 0 {
@@ -321,7 +331,7 @@ func TestRunReadPcap_Count(t *testing.T) {
 	buf, restore := display.CaptureOut()
 	defer restore()
 
-	runReadPcap("testdata/test.pcap", "", "", "normal", "default", false, true, false, false, "", 1)
+	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, "", 1)
 	display.FlushOut()
 
 	out := buf.String()
@@ -335,25 +345,26 @@ func TestRunReadPcap_Count(t *testing.T) {
 
 func TestRunReadPcap_TimestampModes(t *testing.T) {
 	tsModes := []struct {
-		mode        string
+		name        string
+		mode        display.TSMode
 		mustContain string
 	}{
-		{"default", ":"},
-		{"t", "#1"},
-		{"tt", "."},
-		{"ttt", "."},
-		{"tttt", "-"},
+		{"default", display.TSDefault, ":"},
+		{"none", display.TSNone, "#1"},
+		{"unix", display.TSUnix, "."},
+		{"delta", display.TSDelta, "."},
+		{"datetime", display.TSDateTime, "-"},
 	}
 
 	for _, tt := range tsModes {
-		t.Run(tt.mode, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			buf, restore := display.CaptureOut()
 			defer restore()
-			runReadPcap("testdata/test.pcap", "", "", "normal", tt.mode, false, true, false, false, "", 0)
+			runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, tt.mode, false, true, false, false, "", 0)
 			display.FlushOut()
 			got := buf.String()
 			if !strings.Contains(got, tt.mustContain) {
-				t.Errorf("tsMode=%q: want %q in %q", tt.mode, tt.mustContain, got)
+				t.Errorf("tsMode=%v: want %q in %q", tt.mode, tt.mustContain, got)
 			}
 		})
 	}
@@ -464,8 +475,8 @@ func TestStatsUpdate_TCPFlags(t *testing.T) {
 	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1000, 80, true, false)))
 	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1000, 80, false, true)))
 
-	if s.TcpSYN != 1 {
-		t.Errorf("TcpSYN = %d, want 1", s.TcpSYN)
+	if s.TCPSYN != 1 {
+		t.Errorf("TCPSYN = %d, want 1", s.TCPSYN)
 	}
 }
 
@@ -487,7 +498,7 @@ func TestStatsUpdate_TopSrcIP(t *testing.T) {
 
 // display package tests (called from main)
 
-func TestTcpFlagsShort(t *testing.T) {
+func TestTCPFlagsShort(t *testing.T) {
 	tests := []struct {
 		name string
 		tcp  layers.TCP
@@ -503,9 +514,9 @@ func TestTcpFlagsShort(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tcp := tt.tcp
-			got := display.TcpFlagsShort(&tcp)
+			got := display.TCPFlagsShort(&tcp)
 			if got != tt.want {
-				t.Errorf("TcpFlagsShort: want %q, got %q", tt.want, got)
+				t.Errorf("TCPFlagsShort: want %q, got %q", tt.want, got)
 			}
 		})
 	}
@@ -648,7 +659,7 @@ func TestPacketPayload_StripsEthernet(t *testing.T) {
 
 func TestFormatTS_Default(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, "default")
+	got := display.FormatTS(ts, time.Time{}, display.TSDefault)
 	if !strings.Contains(got, "12:30:45.123456") {
 		t.Errorf("default: want HH:MM:SS.us time, got %q", got)
 	}
@@ -656,7 +667,7 @@ func TestFormatTS_Default(t *testing.T) {
 
 func TestFormatTS_T(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 30, 45, 0, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, "t")
+	got := display.FormatTS(ts, time.Time{}, display.TSNone)
 	if got != "" {
 		t.Errorf("-t: want empty string, got %q", got)
 	}
@@ -664,7 +675,7 @@ func TestFormatTS_T(t *testing.T) {
 
 func TestFormatTS_TT(t *testing.T) {
 	ts := time.Unix(1718450000, 123456000)
-	got := display.FormatTS(ts, time.Time{}, "tt")
+	got := display.FormatTS(ts, time.Time{}, display.TSUnix)
 	if !strings.Contains(got, "1718450000") {
 		t.Errorf("-tt: want unix timestamp, got %q", got)
 	}
@@ -672,7 +683,7 @@ func TestFormatTS_TT(t *testing.T) {
 
 func TestFormatTS_TTT_FirstPacket(t *testing.T) {
 	ts := time.Unix(1000, 0)
-	got := display.FormatTS(ts, time.Time{}, "ttt")
+	got := display.FormatTS(ts, time.Time{}, display.TSDelta)
 	if !strings.Contains(got, "0.000000") {
 		t.Errorf("-ttt first packet: want 0.000000, got %q", got)
 	}
@@ -681,7 +692,7 @@ func TestFormatTS_TTT_FirstPacket(t *testing.T) {
 func TestFormatTS_TTT_Delta(t *testing.T) {
 	prev := time.Unix(1000, 0)
 	curr := time.Unix(1000, 500000000)
-	got := display.FormatTS(curr, prev, "ttt")
+	got := display.FormatTS(curr, prev, display.TSDelta)
 	if !strings.Contains(got, "0.500000") {
 		t.Errorf("-ttt delta: want 0.500000, got %q", got)
 	}
@@ -689,7 +700,7 @@ func TestFormatTS_TTT_Delta(t *testing.T) {
 
 func TestFormatTS_TTTT(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, "tttt")
+	got := display.FormatTS(ts, time.Time{}, display.TSDateTime)
 	if !strings.Contains(got, "2024-06-15") {
 		t.Errorf("-tttt: want date, got %q", got)
 	}
@@ -797,26 +808,27 @@ func TestPrintPacket_TimestampModes(t *testing.T) {
 	prev := time.Time{}
 
 	tests := []struct {
-		tsMode      string
+		name        string
+		tsMode      display.TSMode
 		shouldEmpty bool
 		mustContain string
 	}{
-		{"default", false, "12:00:00"},
-		{"t", true, ""},
-		{"tt", false, "."},
-		{"ttt", false, "0.000000"},
-		{"tttt", false, "2024-"},
+		{"default", display.TSDefault, false, "12:00:00"},
+		{"none", display.TSNone, true, ""},
+		{"unix", display.TSUnix, false, "."},
+		{"delta", display.TSDelta, false, "0.000000"},
+		{"datetime", display.TSDateTime, false, "2024-"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.tsMode, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			buf, restore := display.CaptureOut()
 			defer restore()
-			display.PrintPacket(1, pkt, ts, prev, "normal", tt.tsMode, false, true)
+			display.PrintPacket(1, pkt, ts, prev, display.ViewNormal, tt.tsMode, false, true)
 			display.FlushOut()
 			got := buf.String()
 			if !tt.shouldEmpty && !strings.Contains(got, tt.mustContain) {
-				t.Errorf("tsMode=%q: want %q in %q", tt.tsMode, tt.mustContain, got)
+				t.Errorf("tsMode=%v: want %q in %q", tt.tsMode, tt.mustContain, got)
 			}
 		})
 	}
@@ -828,26 +840,27 @@ func TestPrintPacket_ViewModes(t *testing.T) {
 	prev := time.Time{}
 
 	tests := []struct {
-		viewMode    string
+		name        string
+		viewMode    display.ViewMode
 		mustContain string
 	}{
-		{"normal", "1.2.3.4"},
-		{"verbose", "tos"},
-		{"hex", "0000"},
-		{"hexascii", "|"},
-		{"hex_link", "0000"},
-		{"hexascii_link", "|"},
+		{"normal", display.ViewNormal, "1.2.3.4"},
+		{"verbose", display.ViewVerbose, "tos"},
+		{"hex", display.ViewHex, "0000"},
+		{"hexascii", display.ViewHexASCII, "|"},
+		{"hex_link", display.ViewHexLink, "0000"},
+		{"hexascii_link", display.ViewHexASCIILink, "|"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.viewMode, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			buf, restore := display.CaptureOut()
 			defer restore()
-			display.PrintPacket(1, pkt, ts, prev, tt.viewMode, "default", false, true)
+			display.PrintPacket(1, pkt, ts, prev, tt.viewMode, display.TSDefault, false, true)
 			display.FlushOut()
 			got := buf.String()
 			if !strings.Contains(got, tt.mustContain) {
-				t.Errorf("viewMode=%q: want %q in %q", tt.viewMode, tt.mustContain, got)
+				t.Errorf("viewMode=%v: want %q in %q", tt.viewMode, tt.mustContain, got)
 			}
 		})
 	}
@@ -859,7 +872,7 @@ func TestPrintPacket_VerboseWithHex(t *testing.T) {
 
 	buf, restore := display.CaptureOut()
 	defer restore()
-	display.PrintPacket(1, pkt, ts, time.Time{}, "hexascii_link", "default", true, true)
+	display.PrintPacket(1, pkt, ts, time.Time{}, display.ViewHexASCIILink, display.TSDefault, true, true)
 	display.FlushOut()
 
 	got := buf.String()

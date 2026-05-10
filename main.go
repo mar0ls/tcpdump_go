@@ -1,6 +1,6 @@
+//go:generate go run ./cmd/gendocs docs/documentation.md
+
 // tcpdump_go — network packet analyzer built on libpcap and gopacket.
-// Supports live capture, pcap/pcapng file reading, BPF filters, file rotation,
-// flow CSV export, and colorized output. Requires root or CAP_NET_RAW.
 package main
 
 import (
@@ -16,10 +16,10 @@ import (
 	"tcpdump_go/stats"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/pcap"
+	"github.com/gopacket/gopacket/pcapgo"
 )
 
 // packetFileReader is the common interface for pcapgo.Reader and pcapgo.NgReader.
@@ -195,30 +195,30 @@ func main() {
 		log.Fatalf("bufSize %d exceeds max uint32 (%d)", *bufSize, uint(maxUint32))
 	}
 
-	viewMode := "normal"
+	viewMode := display.ViewNormal
 	switch {
 	case *flagXXlink:
-		viewMode = "hexascii_link"
+		viewMode = display.ViewHexASCIILink
 	case *flagxlink:
-		viewMode = "hex_link"
+		viewMode = display.ViewHexLink
 	case *flagXX:
-		viewMode = "hexascii"
+		viewMode = display.ViewHexASCII
 	case *flagX:
-		viewMode = "hex"
+		viewMode = display.ViewHex
 	case *flagV:
-		viewMode = "verbose"
+		viewMode = display.ViewVerbose
 	}
 
-	tsMode := "default"
+	tsMode := display.TSDefault
 	switch {
 	case *flagTTTT:
-		tsMode = "tttt"
+		tsMode = display.TSDateTime
 	case *flagTTT:
-		tsMode = "ttt"
+		tsMode = display.TSDelta
 	case *flagTT:
-		tsMode = "tt"
+		tsMode = display.TSUnix
 	case *flagT:
-		tsMode = "t"
+		tsMode = display.TSNone
 	}
 
 	defer display.FlushOut()
@@ -226,14 +226,28 @@ func main() {
 	if *readPcap != "" {
 		runReadPcap(*readPcap, *filter, *outPcap, viewMode, tsMode, *flagV, *disableDNS, *showStats, *quiet, *csvOut, *count)
 	} else {
-		capture.RunCapture(*iface, *filter, *outPcap, uint32(*snaplen), uint32(*bufSize), //#nosec G115 -- range checked above
-			*promisc, *rotateSize, *rotateTime, viewMode, tsMode, *flagV, *disableDNS, *showStats, *quiet, *count, *disableOffload)
+		capture.RunCapture(capture.Config{
+			Iface:          *iface,
+			Filter:         *filter,
+			OutPcap:        *outPcap,
+			Snaplen:        uint32(*snaplen), //#nosec G115 -- range validated above
+			BufSize:        uint32(*bufSize), //#nosec G115 -- range validated above
+			Promisc:        *promisc,
+			RotateSize:     *rotateSize,
+			RotateTime:     *rotateTime,
+			ViewMode:       viewMode,
+			TSMode:         tsMode,
+			Verbose:        *flagV,
+			DisableDNS:     *disableDNS,
+			ShowStats:      *showStats,
+			Quiet:          *quiet,
+			Count:          *count,
+			DisableOffload: *disableOffload,
+		})
 	}
 }
 
-// runReadPcap reads packets from a pcap/pcapng file, applies an optional BPF
-// filter, prints each packet, and optionally writes to outPcap and csvOut.
-func runReadPcap(pcapFile, filterExpr, outPcap, viewMode, tsMode string, verbose, disableDNS, showStats, quiet bool, csvOut string, count uint64) {
+func runReadPcap(pcapFile, filterExpr, outPcap string, viewMode display.ViewMode, tsMode display.TSMode, verbose, disableDNS, showStats, quiet bool, csvOut string, count uint64) {
 	f, reader := openPcapFile(pcapFile)
 
 	// Compile BPF before registering defer — avoids exitAfterDefer (gocritic).

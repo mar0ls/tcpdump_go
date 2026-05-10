@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 )
 
 // =============================================================================
@@ -205,10 +205,10 @@ func TestExtractTransportInfo_ARP(t *testing.T) {
 }
 
 // =============================================================================
-// TcpFlagsShort
+// TCPFlagsShort
 // =============================================================================
 
-func TestTcpFlagsShort_All(t *testing.T) {
+func TestTCPFlagsShort_All(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		tcp  layers.TCP
@@ -224,7 +224,7 @@ func TestTcpFlagsShort_All(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tcp := tc.tcp
-			if got := TcpFlagsShort(&tcp); got != tc.want {
+			if got := TCPFlagsShort(&tcp); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
@@ -232,28 +232,28 @@ func TestTcpFlagsShort_All(t *testing.T) {
 }
 
 // =============================================================================
-// TcpOptionsStr
+// TCPOptionsStr
 // =============================================================================
 
-func TestTcpOptionsStr_Empty(t *testing.T) {
+func TestTCPOptionsStr_Empty(t *testing.T) {
 	tcp := &layers.TCP{}
-	if got := TcpOptionsStr(tcp); got != "" {
+	if got := TCPOptionsStr(tcp); got != "" {
 		t.Errorf("want empty, got %q", got)
 	}
 }
 
-func TestTcpOptionsStr_NOP(t *testing.T) {
+func TestTCPOptionsStr_NOP(t *testing.T) {
 	tcp := &layers.TCP{Options: []layers.TCPOption{{OptionType: layers.TCPOptionKindNop}}}
-	if got := TcpOptionsStr(tcp); got != "nop" {
+	if got := TCPOptionsStr(tcp); got != "nop" {
 		t.Errorf("want 'nop', got %q", got)
 	}
 }
 
-func TestTcpOptionsStr_MSS(t *testing.T) {
+func TestTCPOptionsStr_MSS(t *testing.T) {
 	tcp := &layers.TCP{Options: []layers.TCPOption{
 		{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xB4}}, // 1460
 	}}
-	got := TcpOptionsStr(tcp)
+	got := TCPOptionsStr(tcp)
 	if !strings.Contains(got, "mss 1460") {
 		t.Errorf("want 'mss 1460', got %q", got)
 	}
@@ -267,22 +267,24 @@ func TestFormatTS_Modes(t *testing.T) {
 	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
 	prev := time.Date(2024, 6, 15, 12, 30, 44, 0, time.UTC)
 	for _, tc := range []struct {
-		mode, contains string
+		name     string
+		mode     TSMode
+		contains string
 	}{
-		{"default", "12:30:45.123456"},
-		{"t", ""},
-		{"tt", "."},
-		{"ttt", "1.123456"},
-		{"tttt", "2024-06-15 12:30:45.123456"},
+		{"default", TSDefault, "12:30:45.123456"},
+		{"none", TSNone, ""},
+		{"unix", TSUnix, "."},
+		{"delta", TSDelta, "1.123456"},
+		{"datetime", TSDateTime, "2024-06-15 12:30:45.123456"},
 	} {
-		t.Run(tc.mode, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			got := FormatTS(ts, prev, tc.mode)
-			if tc.mode == "t" && got != "" {
-				t.Errorf("mode=t: want empty, got %q", got)
+			if tc.mode == TSNone && got != "" {
+				t.Errorf("TSNone: want empty, got %q", got)
 				return
 			}
 			if tc.contains != "" && !strings.Contains(got, tc.contains) {
-				t.Errorf("mode=%s: want %q in %q", tc.mode, tc.contains, got)
+				t.Errorf("mode=%v: want %q in %q", tc.mode, tc.contains, got)
 			}
 		})
 	}
@@ -290,19 +292,19 @@ func TestFormatTS_Modes(t *testing.T) {
 
 func TestFormatTS_TTT_ZeroPrev(t *testing.T) {
 	ts := time.Unix(1000, 0)
-	got := FormatTS(ts, time.Time{}, "ttt")
+	got := FormatTS(ts, time.Time{}, TSDelta)
 	if !strings.Contains(got, "0.000000") {
 		t.Errorf("want 0.000000, got %q", got)
 	}
 }
 
 // =============================================================================
-// IpLayerName
+// IPLayerName
 // =============================================================================
 
-func TestIpLayerName(t *testing.T) {
+func TestIPLayerName(t *testing.T) {
 	pkt4 := decode(buildTCPPacket("1.2.3.4", "5.6.7.8", 80, 80, false, true))
-	if name := IpLayerName(pkt4.NetworkLayer()); name != "IP" {
+	if name := IPLayerName(pkt4.NetworkLayer()); name != "IP" {
 		t.Errorf("IPv4: got %q, want IP", name)
 	}
 }
@@ -392,22 +394,24 @@ func TestPrintPacket_AllViewModes(t *testing.T) {
 	pkt := decode(buildTCPPacket("1.2.3.4", "5.6.7.8", 1000, 80, true, false))
 	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
-		mode, want string
+		name string
+		mode ViewMode
+		want string
 	}{
-		{"normal", "1.2.3.4"},
-		{"verbose", "tos"},
-		{"hex", "0000"},
-		{"hexascii", "|"},
-		{"hex_link", "0000"},
-		{"hexascii_link", "|"},
+		{"normal", ViewNormal, "1.2.3.4"},
+		{"verbose", ViewVerbose, "tos"},
+		{"hex", ViewHex, "0000"},
+		{"hexascii", ViewHexASCII, "|"},
+		{"hex_link", ViewHexLink, "0000"},
+		{"hexascii_link", ViewHexASCIILink, "|"},
 	} {
-		t.Run(tc.mode, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := CaptureOut()
 			defer restore()
-			PrintPacket(1, pkt, ts, time.Time{}, tc.mode, "default", false, true)
+			PrintPacket(1, pkt, ts, time.Time{}, tc.mode, TSDefault, false, true)
 			FlushOut()
 			if !strings.Contains(buf.String(), tc.want) {
-				t.Errorf("mode=%q: brak %q w %q", tc.mode, tc.want, buf.String())
+				t.Errorf("mode=%v: brak %q w %q", tc.mode, tc.want, buf.String())
 			}
 		})
 	}

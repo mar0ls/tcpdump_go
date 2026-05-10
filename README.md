@@ -1,17 +1,17 @@
 # tcpdump_go
 
-![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![docs](https://img.shields.io/badge/docs-generated-blue)
 [![Release](https://img.shields.io/github/v/release/mar0ls/tcpdump_go)](https://github.com/mar0ls/tcpdump_go/releases/latest)
 
-Network packet analyzer written in Go, built on [gopacket](https://github.com/google/gopacket) and libpcap.
+Network packet analyzer written in Go, built on [gopacket](https://github.com/gopacket/gopacket) and libpcap.
 Compatible with tcpdump's flag set, plus extras: pcap file rotation, flow CSV export, colorized output, and detailed statistics.
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.25+
 - libpcap (`sudo apt install libpcap-dev` / `brew install libpcap`)
 - Root or `CAP_NET_RAW` for live capture
 - **Windows:** [Npcap](https://npcap.com/) instead of libpcap
@@ -325,3 +325,4 @@ sudo ./tcpdump_go -i eth0 2>/dev/null          # packets only
 sudo ./tcpdump_go -i eth0 > packets.log        # packets to file
 sudo ./tcpdump_go -i eth0 > packets.log 2> errors.log
 ```
+
