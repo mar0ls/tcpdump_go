@@ -1,6 +1,7 @@
 package display
 
 import (
+	"strconv"
 	"sync"
 
 	"github.com/gopacket/gopacket"
@@ -15,19 +16,33 @@ var hexBufPool = sync.Pool{
 	},
 }
 
-// AppendOffset appends a 4-digit hex offset to buf.
+// AppendOffset appends a hexadecimal offset to buf, padded to at least four
+// digits.  Unlike a fixed-width implementation it does not wrap after 64 KiB.
 func AppendOffset(buf []byte, i int) []byte {
-	return append(buf,
-		hexTable[(i>>12)&0xf],
-		hexTable[(i>>8)&0xf],
-		hexTable[(i>>4)&0xf],
-		hexTable[i&0xf],
-	)
+	if i < 0 {
+		buf = append(buf, '-')
+		// Avoid overflowing on the minimum int value.
+		u := uint64(-(i + 1)) + 1 //nolint:gosec // two's-complement negation of a negative int; cannot overflow
+		return appendPaddedHex(buf, u)
+	}
+	return appendPaddedHex(buf, uint64(i))
+}
+
+func appendPaddedHex(buf []byte, value uint64) []byte {
+	digits := 1
+	for n := value; n >= 16; n >>= 4 {
+		digits++
+	}
+	for range max(0, 4-digits) {
+		buf = append(buf, '0')
+	}
+	return strconv.AppendUint(buf, value, 16)
 }
 
 // PrintHex prints data as a hex dump (-x style) to Out.
-func PrintHex(data []byte) {
+func PrintHex(data []byte) error {
 	bufPtr := hexBufPool.Get().(*[]byte)
+	defer hexBufPool.Put(bufPtr)
 	for i := 0; i < len(data); i += 16 {
 		end := min(i+16, len(data))
 		buf := (*bufPtr)[:0]
@@ -43,15 +58,19 @@ func PrintHex(data []byte) {
 			buf = append(buf, hexTable[data[j]>>4], hexTable[data[j]&0xf], ' ')
 		}
 		buf = append(buf, '\n')
-		_, _ = Out.Write(buf)
+		if err := writeOutput(buf); err != nil {
+			*bufPtr = buf
+			return err
+		}
 		*bufPtr = buf
 	}
-	hexBufPool.Put(bufPtr)
+	return nil
 }
 
 // PrintHexASCII prints data as hex+ASCII (-X style) to Out.
-func PrintHexASCII(data []byte) {
+func PrintHexASCII(data []byte) error {
 	bufPtr := hexBufPool.Get().(*[]byte)
+	defer hexBufPool.Put(bufPtr)
 	for i := 0; i < len(data); i += 16 {
 		end := min(i+16, len(data))
 		buf := (*bufPtr)[:0]
@@ -84,10 +103,40 @@ func PrintHexASCII(data []byte) {
 			}
 		}
 		buf = append(buf, '\n')
-		_, _ = Out.Write(buf)
+		if err := writeOutput(buf); err != nil {
+			*bufPtr = buf
+			return err
+		}
 		*bufPtr = buf
 	}
-	hexBufPool.Put(bufPtr)
+	return nil
+}
+
+// PrintASCII prints packet bytes in a terminal-safe ASCII form (-A style).
+// Control and non-ASCII bytes become dots, and long packets are wrapped to
+// keep each output line readable.
+func PrintASCII(data []byte) error {
+	const columns = 64
+	bufPtr := hexBufPool.Get().(*[]byte)
+	defer hexBufPool.Put(bufPtr)
+	for i := 0; i < len(data); i += columns {
+		end := min(i+columns, len(data))
+		buf := (*bufPtr)[:0]
+		for _, b := range data[i:end] {
+			if b >= 32 && b <= 126 {
+				buf = append(buf, b)
+			} else {
+				buf = append(buf, '.')
+			}
+		}
+		buf = append(buf, '\n')
+		if err := writeOutput(buf); err != nil {
+			*bufPtr = buf
+			return err
+		}
+		*bufPtr = buf
+	}
+	return nil
 }
 
 // PacketPayload returns packet data above the link layer.

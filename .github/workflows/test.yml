@@ -8,6 +8,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GOTOOLCHAIN: local
 
 permissions:
   contents: read
@@ -15,18 +16,35 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ['1.25.x', '1.26.x']
 
     steps:
       - uses: cicd-sensor/cicd-sensor-action@2b76335ff1c2dd298e983961f7a200d3fe9076c2 # v0.0.36
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: ${{ matrix.go-version }}
+          cache-dependency-path: go.sum
 
-      - name: Install libpcap
-        run: sudo apt-get install -y libpcap-dev
+      - name: Install libpcap and tcpdump
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev tcpdump
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check formatting and generated documentation
+        run: |
+          gofmt -w .
+          git diff --exit-code
+          go generate ./...
+          git diff --exit-code -- docs/documentation.md
 
       - name: Build
         run: go build ./...
@@ -34,5 +52,23 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Lint
+        if: matrix.go-version == '1.26.x'
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4 run ./...
+
       - name: Test
-        run: go test -race ./...
+        run: go test -count=1 ./...
+
+      - name: Race detector
+        if: matrix.go-version == '1.26.x'
+        run: go test -race -count=1 ./...
+
+      - name: Coverage
+        if: matrix.go-version == '1.26.x'
+        run: |
+          go test -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Vulnerability scan
+        if: matrix.go-version == '1.26.x'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...

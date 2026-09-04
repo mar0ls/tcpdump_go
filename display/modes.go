@@ -11,6 +11,8 @@ const (
 	ViewHexASCII                     // -X
 	ViewHexLink                      // -xx
 	ViewHexASCIILink                 // -XX
+	ViewQuick                        // -q: shorter one-line summary
+	ViewASCII                        // -A: safe ASCII above the link layer
 )
 
 // TSMode controls how the packet timestamp is rendered.

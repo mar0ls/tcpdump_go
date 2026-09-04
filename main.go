@@ -1,358 +1,580 @@
 //go:generate go run ./cmd/gendocs docs/documentation.md
 
-// tcpdump_go — network packet analyzer built on libpcap and gopacket.
+// tcpdump_go is a tcpdump-compatible packet analyzer with richer statistics
+// and lossless classic-pcap/pcapng processing.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"math"
 	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"tcpdump_go/capture"
 	"tcpdump_go/display"
-	"tcpdump_go/rotation"
-	"tcpdump_go/stats"
-	"time"
-
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
-	"github.com/gopacket/gopacket/pcapgo"
+	"tcpdump_go/internal/pathguard"
 )
 
-// packetFileReader is the common interface for pcapgo.Reader and pcapgo.NgReader.
-type packetFileReader interface {
-	gopacket.PacketDataSource
-	LinkType() layers.LinkType
+const defaultSnaplen = uint64(262144)
+
+type cliOptions struct {
+	iface      string
+	readPcap   string
+	filter     string
+	filterFile string
+	count      uint64
+
+	outPcap      string
+	pcapngOutput bool
+	rotateSize   uint64
+	rotateTime   uint64
+	rotateMB     uint64
+	maxFiles     uint64
+	rotateSecs   uint64
+	csvOut       string
+	printPackets bool
+
+	snaplen         uint64
+	bufferKB        uint64
+	promisc         bool
+	noPromisc       bool
+	disableOffload  bool
+	dropUser        string
+	noImmediateMode bool
+
+	verbosity    int
+	hex          bool
+	hexASCII     bool
+	hexLink      bool
+	hexASCIILink bool
+	ascii        bool
+	quick        bool
+	linkHeader   bool
+	absSeq       bool
+	number       bool
+
+	noTimestamp bool
+	unixTime    bool
+	deltaTime   bool
+	dateTime    bool
+
+	disableDNS     bool
+	disableDNSAll  bool
+	foreignNumeric bool
+	showStats      bool
+	statsOnly      bool
+	countOnly      bool
+	lineBuffered   bool
+	packetBuffered bool
+	listInterfaces bool
+	version        bool
+	color          string
 }
 
-// pcapngMagic holds the first 4 bytes of a pcapng file (Section Header Block).
-var pcapngMagic = [4]byte{0x0a, 0x0d, 0x0d, 0x0a}
-
-// openPcapFile detects the file format by magic bytes and returns the appropriate reader.
-// The caller is responsible for closing the returned file.
-func openPcapFile(path string) (*os.File, packetFileReader) {
-	f, err := os.Open(path) //#nosec G304 -- path comes from a CLI flag
-	if err != nil {
-		log.Fatalf("cannot open file: %v", err)
-	}
-
-	var magic [4]byte
-	if _, err := io.ReadFull(f, magic[:]); err != nil {
-		if cerr := f.Close(); cerr != nil {
-			log.Printf("close file: %v", cerr)
-		}
-		log.Fatalf("read file header: %v", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		if cerr := f.Close(); cerr != nil {
-			log.Printf("close file: %v", cerr)
-		}
-		log.Fatalf("seek file: %v", err)
-	}
-
-	if magic == pcapngMagic {
-		r, err := pcapgo.NewNgReader(f, pcapgo.DefaultNgReaderOptions)
-		if err != nil {
-			if cerr := f.Close(); cerr != nil {
-				log.Printf("close file: %v", cerr)
-			}
-			log.Fatalf("open pcapng: %v", err)
-		}
-		display.Outf("%s pcapng\n", display.Colorize("Format:", display.ColorCyan))
-		return f, r
-	}
-
-	r, err := pcapgo.NewReader(f)
-	if err != nil {
-		if cerr := f.Close(); cerr != nil {
-			log.Printf("close file: %v", cerr)
-		}
-		log.Fatalf("open pcap: %v", err)
-	}
-	return f, r
+// boolFlags lists flags eligible for POSIX-style combination (-nXX, -vv,
+// -tttt). Long flags are intentionally excluded from expansion.
+var boolFlags = []string{
+	"disable-offload", "stats-only", "immediate-mode", "pcapng", "print",
+	"stats", "version", "promisc", "tttt", "nn", "xx", "XX", "ttt",
+	"tt", "A", "D", "N", "S", "U", "e", "f", "l", "n", "p", "q",
+	"t", "v", "x", "X", "#",
 }
 
-// boolFlags lists boolean flag names in descending length order for greedy matching.
-var boolFlags = []string{"tttt", "ttt", "disable-offload", "promisc", "stats", "xx", "XX", "tt", "v", "x", "X", "n", "q", "t"}
+// valueFlags lists single-letter flags taking a value. getopt allows the value
+// to be glued on (-c100, -nni eth0), so those forms are accepted too. No name
+// here collides with boolFlags, which keeps the split unambiguous.
+var valueFlags = []string{"B", "C", "F", "G", "W", "Z", "c", "i", "r", "s", "w"}
 
-// expandArgs splits POSIX-style combined flags: -nXX → -n -XX, -nv → -n -v.
+// expandArgs rewrites combined POSIX arguments into the one-flag-per-argument
+// form the flag package needs.
 func expandArgs(args []string) []string {
 	out := make([]string, 0, len(args)+4)
 	for _, arg := range args {
-		if len(arg) < 3 || arg[0] != '-' || arg[1] == '-' {
-			out = append(out, arg)
+		expanded, ok := expandArg(arg)
+		if ok {
+			out = append(out, expanded...)
 			continue
 		}
-		rest := arg[1:]
-		expanded := make([]string, 0, 4)
-		ok := true
-		for len(rest) > 0 {
-			matched := false
-			for _, f := range boolFlags {
-				if strings.HasPrefix(rest, f) {
-					expanded = append(expanded, "-"+f)
-					rest = rest[len(f):]
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				ok = false
-				break
-			}
-		}
-		if ok && len(expanded) > 1 {
-			out = append(out, expanded...)
-		} else {
-			out = append(out, arg)
-		}
+		out = append(out, arg)
 	}
 	return out
 }
 
-func main() {
-	os.Args = append(os.Args[:1], expandArgs(os.Args[1:])...)
-	// Packet source
-	iface := flag.String("i", "", "")
-	readPcap := flag.String("r", "", "")
-	filter := flag.String("f", "", "")
-	count := flag.Uint64("c", 0, "")
-
-	// Output
-	outPcap := flag.String("w", "", "")
-	rotateSize := flag.Uint64("rotate-size", 0, "")
-	rotateTime := flag.Uint64("rotate-time", 0, "")
-	csvOut := flag.String("csv", "", "")
-
-	// Capture
-	snaplen := flag.Uint("s", 65535, "")
-	bufSize := flag.Uint("B", 0, "")
-	promisc := flag.Bool("promisc", true, "")
-	disableOffload := flag.Bool("disable-offload", false, "")
-
-	flagV := flag.Bool("v", false, "")
-	flagX := flag.Bool("x", false, "")
-	flagXX := flag.Bool("X", false, "")
-	flagxlink := flag.Bool("xx", false, "")
-	flagXXlink := flag.Bool("XX", false, "")
-
-	flagT := flag.Bool("t", false, "")
-	flagTT := flag.Bool("tt", false, "")
-	flagTTT := flag.Bool("ttt", false, "")
-	flagTTTT := flag.Bool("tttt", false, "")
-
-	// Misc
-	disableDNS := flag.Bool("n", false, "")
-	showStats := flag.Bool("stats", false, "")
-	quiet := flag.Bool("q", false, "")
-
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: tcpdump_go [options] [BPF expression]\n\n")
-		fmt.Fprintf(os.Stderr, "Source:\n")
-		fmt.Fprintf(os.Stderr, "  -i <iface>      Network interface (no -i: list available)\n")
-		fmt.Fprintf(os.Stderr, "  -r <file>       Read from .pcap or .pcapng file\n")
-		fmt.Fprintf(os.Stderr, "  -f <filter>     BPF filter, e.g. 'tcp port 443'\n")
-		fmt.Fprintf(os.Stderr, "  -c <N>          Capture/process only N packets\n")
-		fmt.Fprintf(os.Stderr, "\nOutput:\n")
-		fmt.Fprintf(os.Stderr, "  -w <file>       Write packets to .pcap file\n")
-		fmt.Fprintf(os.Stderr, "  -rotate-size N  Rotate -w file after N bytes\n")
-		fmt.Fprintf(os.Stderr, "  -rotate-time N  Rotate -w file every N seconds\n")
-		fmt.Fprintf(os.Stderr, "  -csv <file>     Write flows to CSV (only with -r)\n")
-		fmt.Fprintf(os.Stderr, "\nCapture:\n")
-		fmt.Fprintf(os.Stderr, "  -s <snaplen>    Max bytes per packet (default: 65535)\n")
-		fmt.Fprintf(os.Stderr, "  -B <KB>         Kernel pcap buffer in KB (default: 2048 KB)\n")
-		fmt.Fprintf(os.Stderr, "  -promisc        Promiscuous mode — enabled by default\n")
-		fmt.Fprintf(os.Stderr, "  -disable-offload  Disable NIC offloading via ethtool (Linux, root)\n")
-		fmt.Fprintf(os.Stderr, "\nView:\n")
-		fmt.Fprintf(os.Stderr, "  -v              Verbose — more packet detail\n")
-		fmt.Fprintf(os.Stderr, "  -x              Hex (no Ethernet header)\n")
-		fmt.Fprintf(os.Stderr, "  -X              Hex + ASCII (no Ethernet header)\n")
-		fmt.Fprintf(os.Stderr, "  -xx             Hex (with Ethernet header)\n")
-		fmt.Fprintf(os.Stderr, "  -XX             Hex + ASCII (with Ethernet header)\n")
-		fmt.Fprintf(os.Stderr, "\nTimestamp:\n")
-		fmt.Fprintf(os.Stderr, "  -t              No timestamp\n")
-		fmt.Fprintf(os.Stderr, "  -tt             Unix timestamp (seconds.microseconds)\n")
-		fmt.Fprintf(os.Stderr, "  -ttt            Delta from previous packet\n")
-		fmt.Fprintf(os.Stderr, "  -tttt           Date + time (2006-01-02 15:04:05.000000)\n")
-		fmt.Fprintf(os.Stderr, "\nMisc:\n")
-		fmt.Fprintf(os.Stderr, "  -n              Disable reverse DNS\n")
-		fmt.Fprintf(os.Stderr, "  -stats          Print statistics summary on exit\n")
-		fmt.Fprintf(os.Stderr, "  -q              Quiet mode — print only statistics (requires -stats)\n")
+// expandArg expands one argument. Anything not fully recognized is left
+// untouched so the flag package reports it verbatim.
+func expandArg(arg string) ([]string, bool) {
+	if len(arg) < 3 || arg[0] != '-' || arg[1] == '-' || strings.Contains(arg, "=") {
+		return nil, false
 	}
-
-	flag.Parse()
-	if *csvOut != "" && *readPcap == "" {
-		log.Fatal("-csv requires -r (read from pcap/pcapng file)")
-	}
-	const maxUint32 = 1<<32 - 1
-	if *snaplen > maxUint32 {
-		log.Fatalf("snaplen %d exceeds max uint32 (%d)", *snaplen, uint(maxUint32))
-	}
-	if *bufSize > maxUint32 {
-		log.Fatalf("bufSize %d exceeds max uint32 (%d)", *bufSize, uint(maxUint32))
-	}
-
-	viewMode := display.ViewNormal
-	switch {
-	case *flagXXlink:
-		viewMode = display.ViewHexASCIILink
-	case *flagxlink:
-		viewMode = display.ViewHexLink
-	case *flagXX:
-		viewMode = display.ViewHexASCII
-	case *flagX:
-		viewMode = display.ViewHex
-	case *flagV:
-		viewMode = display.ViewVerbose
-	}
-
-	tsMode := display.TSDefault
-	switch {
-	case *flagTTTT:
-		tsMode = display.TSDateTime
-	case *flagTTT:
-		tsMode = display.TSDelta
-	case *flagTT:
-		tsMode = display.TSUnix
-	case *flagT:
-		tsMode = display.TSNone
-	}
-
-	defer display.FlushOut()
-
-	if *readPcap != "" {
-		runReadPcap(*readPcap, *filter, *outPcap, viewMode, tsMode, *flagV, *disableDNS, *showStats, *quiet, *csvOut, *count)
-	} else {
-		capture.RunCapture(capture.Config{
-			Iface:          *iface,
-			Filter:         *filter,
-			OutPcap:        *outPcap,
-			Snaplen:        uint32(*snaplen), //#nosec G115 -- range validated above
-			BufSize:        uint32(*bufSize), //#nosec G115 -- range validated above
-			Promisc:        *promisc,
-			RotateSize:     *rotateSize,
-			RotateTime:     *rotateTime,
-			ViewMode:       viewMode,
-			TSMode:         tsMode,
-			Verbose:        *flagV,
-			DisableDNS:     *disableDNS,
-			ShowStats:      *showStats,
-			Quiet:          *quiet,
-			Count:          *count,
-			DisableOffload: *disableOffload,
-		})
-	}
-}
-
-func runReadPcap(pcapFile, filterExpr, outPcap string, viewMode display.ViewMode, tsMode display.TSMode, verbose, disableDNS, showStats, quiet bool, csvOut string, count uint64) {
-	f, reader := openPcapFile(pcapFile)
-
-	// Compile BPF before registering defer — avoids exitAfterDefer (gocritic).
-	var bpfFilter *pcap.BPF
-	if filterExpr != "" {
-		var err error
-		bpfFilter, err = pcap.NewBPF(reader.LinkType(), 65535, filterExpr)
-		if err != nil {
-			_ = f.Close()
-			log.Fatalf("invalid BPF filter %q: %v", filterExpr, err)
-		}
-	}
-
-	var pw *rotation.PcapWriter
-	if outPcap != "" {
-		pw = rotation.NewPcapWriter(outPcap, 65535, reader.LinkType(), 0, 0)
-		pw.Open()
-	}
-
-	defer func() {
-		if pw != nil {
-			pw.Close()
-		}
-		if err := f.Close(); err != nil {
-			log.Printf("close file: %v", err)
-		}
-	}()
-
-	packetSource := gopacket.NewPacketSource(reader, reader.LinkType())
-	packetSource.Lazy = true
-	packetSource.NoCopy = true
-
-	st := stats.NewStats()
-	flowMap := make(map[flowKey]int)
-
-	var pktNum uint64
-	var prevTS time.Time
-	for packet := range packetSource.Packets() {
-		if bpfFilter != nil && !bpfFilter.Matches(packet.Metadata().CaptureInfo, packet.Data()) {
+	rest := arg[1:]
+	expanded := make([]string, 0, 4)
+	for rest != "" {
+		if name, ok := matchFlag(rest, boolFlags); ok {
+			expanded = append(expanded, "-"+name)
+			rest = rest[len(name):]
 			continue
 		}
-		pktNum++
-		ts := packet.Metadata().Timestamp
-		if !quiet {
-			display.PrintPacket(pktNum, packet, ts, prevTS, viewMode, tsMode, verbose, disableDNS)
+		name, ok := matchFlag(rest, valueFlags)
+		if !ok {
+			return nil, false
 		}
-		prevTS = ts
-		st.Update(packet)
-
-		if pw != nil {
-			pw.WritePacket(ts, packet.Data())
+		// A value flag ends the cluster: the rest is its value, or the value is
+		// the next argument when nothing is glued on.
+		expanded = append(expanded, "-"+name)
+		if value := rest[len(name):]; value != "" {
+			expanded = append(expanded, value)
 		}
+		rest = ""
+	}
+	if len(expanded) < 2 {
+		return nil, false
+	}
+	return expanded, true
+}
 
-		if csvOut != "" {
-			proto, sport, dport := display.ExtractTransportInfo(packet)
-			if sport != "" {
-				if nl := packet.NetworkLayer(); nl != nil {
-					src, dst := nl.NetworkFlow().Endpoints()
-					k := flowKey{src.String(), dst.String(), sport, dport, proto}
-					flowMap[k]++
-				}
-			}
-		}
+// verbosityCounter is a flag.Value that counts occurrences instead of taking a
+// value, so -v -vv -vvv all raise the level the way tcpdump does.
+type verbosityCounter int
 
-		if count > 0 && pktNum >= count {
-			break
+func (c *verbosityCounter) String() string   { return strconv.Itoa(int(*c)) }
+func (c *verbosityCounter) IsBoolFlag() bool { return true }
+
+func (c *verbosityCounter) Set(value string) error {
+	// "-v=false" resets; a bare "-v" arrives as "true".
+	if value == "false" {
+		*c = 0
+		return nil
+	}
+	*c++
+	return nil
+}
+
+func matchFlag(rest string, names []string) (string, bool) {
+	for _, name := range names {
+		if strings.HasPrefix(rest, name) {
+			return name, true
 		}
 	}
+	return "", false
+}
 
-	display.FlushOut()
-
-	if showStats {
-		st.Print()
-	}
-
-	if csvOut != "" {
-		writeCSV(csvOut, flowMap)
+func main() {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "tcpdump_go: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-// flowKey identifies a unique network flow: IP pair + ports + protocol.
-type flowKey struct{ Src, Dst, Sport, Dport, Proto string }
-
-// writeCSV writes aggregated flows to a CSV file.
-func writeCSV(outFile string, flowMap map[flowKey]int) {
-	f, err := os.Create(outFile) //#nosec G304 -- outFile comes from the -csv flag, not untrusted input
+func run(args []string, stdout, stderr io.Writer) (retErr error) {
+	options, err := parseOptions(args, stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return nil
+	}
 	if err != nil {
-		log.Fatalf("cannot create CSV file: %v", err)
+		return err
+	}
+	if options.version {
+		_, err := fmt.Fprintln(stdout, versionString())
+		return err
+	}
+	if err := finalizeOptions(&options); err != nil {
+		return err
+	}
+	previousColor := display.UseColor
+	defer func() { display.UseColor = previousColor }()
+
+	// Only a genuinely empty invocation has the documented "list and exit"
+	// shorthand. Options such as -w or --stats without a source are mistakes,
+	// not requests to silently ignore those options.
+	if options.listInterfaces || len(args) == 0 {
+		if err := configureDisplay(stdout, options.lineBuffered, options.color); err != nil {
+			return err
+		}
+		defer func() { retErr = errors.Join(retErr, display.ResetOutput()) }()
+		return capture.PrintInterfaces(options.verbosity)
+	}
+	if options.iface == "" && options.readPcap == "" {
+		return errors.New("a capture source is required: use -i <interface> or -r <file>")
+	}
+
+	printPackets := options.outPcap == "" || options.printPackets
+	if options.statsOnly || options.countOnly {
+		printPackets = false
+	}
+	textOutput := stdout
+	if options.outPcap == "-" || (options.outPcap != "" && !printPackets) {
+		textOutput = stderr
+	}
+	if err := configureDisplay(textOutput, options.lineBuffered, options.color); err != nil {
+		return err
 	}
 	defer func() {
-		if cerr := f.Close(); cerr != nil {
-			log.Printf("close CSV file: %v", cerr)
-		}
+		retErr = errors.Join(retErr, display.FlushOut(), display.ResetOutput())
 	}()
+	display.ConfigureRenderer(display.RenderOptions{
+		LinkHeader:              options.linkHeader,
+		ShowPacketNumber:        options.number,
+		AbsoluteSequenceNumbers: options.absSeq,
+		NumericPorts:            options.disableDNS,
+	})
+	defer display.ResetRenderer()
 
-	if _, err := fmt.Fprintln(f, "src_ip,dst_ip,src_port,dst_port,proto,count"); err != nil {
-		log.Printf("write CSV header: %v", err)
-		return
+	viewMode := selectViewMode(options)
+	tsMode := selectTimestampMode(options)
+	if options.readPcap != "" {
+		return runReadPcap(options, viewMode, tsMode, printPackets, stdout, stderr)
 	}
-	for k, cnt := range flowMap {
-		if _, err := fmt.Fprintf(f, "%s,%s,%s,%s,%s,%d\n", k.Src, k.Dst, k.Sport, k.Dport, k.Proto, cnt); err != nil {
-			log.Printf("write CSV row: %v", err)
-			return
+	return capture.RunCapture(capture.Config{
+		Iface:                options.iface,
+		Filter:               options.filter,
+		OutPcap:              options.outPcap,
+		PcapNG:               options.pcapngOutput,
+		Snaplen:              uint32(options.snaplen),  //nolint:gosec // finalizeOptions rejects values above MaxInt32
+		BufSize:              uint32(options.bufferKB), //nolint:gosec // finalizeOptions rejects values above MaxInt32/1024
+		Promisc:              options.promisc,
+		RotateSize:           options.rotateSize,
+		RotateTime:           options.rotateTime,
+		MaxFiles:             options.maxFiles,
+		ViewMode:             viewMode,
+		TSMode:               tsMode,
+		Verbosity:            options.verbosity,
+		DisableDNS:           options.disableDNS,
+		ShowStats:            options.showStats,
+		Quiet:                !printPackets,
+		Count:                options.count,
+		DisableOffload:       options.disableOffload,
+		DropUser:             options.dropUser,
+		NoImmediateMode:      options.noImmediateMode,
+		FlushEveryPacket:     options.lineBuffered,
+		FlushPcapEveryPacket: options.packetBuffered,
+		StatusWriter:         stderr,
+	})
+}
+
+func parseOptions(args []string, stderr io.Writer) (cliOptions, error) {
+	var options cliOptions
+	fs := flag.NewFlagSet("tcpdump_go", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&options.iface, "i", "", "capture interface: name, or the number shown by -D")
+	fs.StringVar(&options.readPcap, "r", "", "read pcap/pcapng file; - means stdin")
+	fs.StringVar(&options.filter, "filter", "", "BPF expression (extension; positional syntax is preferred)")
+	fs.StringVar(&options.filterFile, "F", "", "read BPF expression from file")
+	fs.Uint64Var(&options.count, "c", 0, "stop after N matching packets")
+
+	fs.StringVar(&options.outPcap, "w", "", "write raw packets; - means stdout")
+	fs.BoolVar(&options.pcapngOutput, "pcapng", false, "write pcapng rather than classic pcap")
+	fs.Uint64Var(&options.maxFiles, "W", 0, "limit rotation to N files (cyclic with -C, stop with -G)")
+	fs.Uint64Var(&options.rotateMB, "C", 0, "rotate after N million bytes")
+	fs.Uint64Var(&options.rotateSecs, "G", 0, "rotate every N seconds")
+	fs.Uint64Var(&options.rotateSize, "rotate-size", 0, "rotate after N bytes (extension)")
+	fs.Uint64Var(&options.rotateTime, "rotate-time", 0, "rotate every N seconds (extension)")
+	fs.StringVar(&options.csvOut, "csv", "", "write aggregated flows as CSV (offline)")
+	fs.BoolVar(&options.printPackets, "print", false, "also print packet summaries with -w")
+
+	fs.Uint64Var(&options.snaplen, "s", defaultSnaplen, "snapshot length; 0 selects the default maximum")
+	fs.Uint64Var(&options.bufferKB, "B", 0, "capture buffer size in KiB")
+	fs.BoolVar(&options.promisc, "promisc", true, "enable promiscuous mode (legacy extension)")
+	fs.BoolVar(&options.noPromisc, "p", false, "do not capture in promiscuous mode")
+	fs.BoolVar(&options.disableOffload, "disable-offload", false, "temporarily disable and later restore NIC offloads (Linux)")
+	fs.StringVar(&options.dropUser, "Z", "", "drop privileges to this user after opening the capture source")
+	immediateMode := true
+	fs.BoolVar(&immediateMode, "immediate-mode", true, "deliver packets as they arrive; --immediate-mode=false buffers for throughput")
+
+	fs.Var((*verbosityCounter)(&options.verbosity), "v", "verbose packet details; repeat for more (-vv, -vvv)")
+	fs.BoolVar(&options.hex, "x", false, "hex dump without link header")
+	fs.BoolVar(&options.hexASCII, "X", false, "hex and ASCII without link header")
+	fs.BoolVar(&options.hexLink, "xx", false, "hex dump including link header")
+	fs.BoolVar(&options.hexASCIILink, "XX", false, "hex and ASCII including link header")
+	fs.BoolVar(&options.ascii, "A", false, "ASCII dump without link header")
+	fs.BoolVar(&options.quick, "q", false, "quick/short protocol output")
+	fs.BoolVar(&options.linkHeader, "e", false, "print link-layer header")
+	fs.BoolVar(&options.absSeq, "S", false, "print absolute TCP sequence numbers")
+	fs.BoolVar(&options.number, "#", false, "print packet number")
+	fs.BoolVar(&options.number, "number", false, "print packet number")
+
+	fs.BoolVar(&options.noTimestamp, "t", false, "do not print timestamps")
+	fs.BoolVar(&options.unixTime, "tt", false, "print Unix timestamps")
+	fs.BoolVar(&options.deltaTime, "ttt", false, "print delta from previous packet")
+	fs.BoolVar(&options.dateTime, "tttt", false, "print local date and time")
+
+	fs.BoolVar(&options.disableDNS, "n", false, "do not resolve host names")
+	fs.BoolVar(&options.disableDNSAll, "nn", false, "do not resolve host or service names")
+	fs.BoolVar(&options.foreignNumeric, "f", false, "print foreign addresses numerically")
+	fs.BoolVar(&options.showStats, "stats", false, "print extended session statistics")
+	fs.BoolVar(&options.statsOnly, "stats-only", false, "suppress packets and print statistics")
+	fs.BoolVar(&options.countOnly, "count", false, "count matching packets without printing them")
+	fs.BoolVar(&options.lineBuffered, "l", false, "flush text output after each packet")
+	fs.BoolVar(&options.packetBuffered, "U", false, "flush raw capture output after each packet")
+	fs.BoolVar(&options.listInterfaces, "D", false, "list capture interfaces")
+	fs.BoolVar(&options.version, "version", false, "print version")
+	fs.StringVar(&options.color, "color", "auto", "color mode: auto, always, never")
+
+	fs.Usage = func() { printUsage(fs.Output()) }
+	if err := fs.Parse(expandArgs(args)); err != nil {
+		return cliOptions{}, err
+	}
+	options.noImmediateMode = !immediateMode
+	positional := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if positional != "" && options.filter != "" {
+		return cliOptions{}, errors.New("use either a positional BPF expression or --filter, not both")
+	}
+	if positional != "" {
+		options.filter = positional
+	}
+	if options.filterFile != "" {
+		if options.filter != "" {
+			return cliOptions{}, errors.New("-F cannot be combined with another BPF expression")
+		}
+		filter, err := readFilterFile(options.filterFile)
+		if err != nil {
+			return cliOptions{}, err
+		}
+		options.filter = filter
+	}
+	return options, nil
+}
+
+func finalizeOptions(options *cliOptions) error {
+	if options.iface != "" && options.readPcap != "" {
+		return errors.New("-i and -r are mutually exclusive")
+	}
+	// tcpdump accepts the device number printed by -D as well as its name.
+	resolved, err := capture.ResolveInterface(options.iface)
+	if err != nil {
+		return err
+	}
+	options.iface = resolved
+	if options.snaplen == 0 {
+		options.snaplen = defaultSnaplen
+	}
+	if options.snaplen > math.MaxInt32 {
+		return fmt.Errorf("snaplen %d exceeds libpcap limit %d", options.snaplen, int64(math.MaxInt32))
+	}
+	if options.bufferKB > math.MaxInt32/1024 {
+		return fmt.Errorf("capture buffer %d KiB exceeds libpcap limit", options.bufferKB)
+	}
+	if options.noPromisc {
+		options.promisc = false
+	}
+	if options.dropUser != "" && options.disableOffload {
+		return errors.New("-Z cannot be combined with --disable-offload: restoring NIC offloads requires the privileges being dropped")
+	}
+	// tcpdump's -n already suppresses both host and port name lookup, so -nn
+	// and -f fold into the same switch. Verified against tcpdump: -n and -nn
+	// print identical address.port pairs.
+	options.disableDNS = options.disableDNS || options.disableDNSAll || options.foreignNumeric
+	if options.statsOnly {
+		options.showStats = true
+	}
+	if options.csvOut != "" && options.readPcap == "" {
+		return errors.New("-csv requires offline input with -r")
+	}
+	if options.csvOut == "-" {
+		return errors.New("-csv - is not supported because it can corrupt packet/statistics output")
+	}
+	if options.rotateMB > 0 {
+		if options.rotateSize > 0 {
+			return errors.New("use either -C or -rotate-size, not both")
+		}
+		if options.rotateMB > math.MaxUint64/1_000_000 {
+			return errors.New("-C value is too large")
+		}
+		options.rotateSize = options.rotateMB * 1_000_000
+	}
+	if options.rotateSecs > 0 {
+		if options.rotateTime > 0 {
+			return errors.New("use either -G or -rotate-time, not both")
+		}
+		options.rotateTime = options.rotateSecs
+	}
+	if options.maxFiles > 0 && options.rotateSize == 0 && options.rotateTime == 0 {
+		return errors.New("-W needs a rotation trigger: combine it with -C or -G")
+	}
+	if (options.rotateSize > 0 || options.rotateTime > 0) && options.outPcap == "" {
+		return errors.New("capture rotation requires -w")
+	}
+	if options.outPcap != "" && strings.EqualFold(filepath.Ext(options.outPcap), ".pcapng") {
+		options.pcapngOutput = true
+	}
+	if options.pcapngOutput && (options.rotateSize > 0 || options.rotateTime > 0) {
+		return errors.New("pcapng rotation is not yet supported; choose classic .pcap or disable rotation")
+	}
+	if options.outPcap == "-" && (options.rotateSize > 0 || options.rotateTime > 0) {
+		return errors.New("rotation is not supported for -w -")
+	}
+	if options.packetBuffered && options.outPcap == "" {
+		return errors.New("-U requires raw output with -w")
+	}
+	if options.pcapngOutput && options.outPcap == "" {
+		return errors.New("--pcapng requires raw output with -w")
+	}
+	if options.printPackets && options.outPcap == "" {
+		return errors.New("--print requires raw output with -w")
+	}
+	switch options.color {
+	case "auto", "always", "never":
+	default:
+		return fmt.Errorf("invalid --color value %q (want auto, always, or never)", options.color)
+	}
+	if options.readPcap != "" {
+		if err := pathguard.ValidateOutputPaths(options.readPcap, options.outPcap, options.csvOut, options.rotateSize > 0 || options.rotateTime > 0); err != nil {
+			return err
 		}
 	}
-	display.Outf("%s %s\n", display.Colorize("CSV flows written:", display.ColorCyan), outFile)
-	display.FlushOut()
+	return nil
 }
+
+func selectViewMode(options cliOptions) display.ViewMode {
+	switch {
+	case options.hexASCIILink:
+		return display.ViewHexASCIILink
+	case options.hexLink:
+		return display.ViewHexLink
+	case options.hexASCII:
+		return display.ViewHexASCII
+	case options.hex:
+		return display.ViewHex
+	case options.ascii:
+		return display.ViewASCII
+	case options.quick:
+		return display.ViewQuick
+	case options.verbosity > 0:
+		return display.ViewVerbose
+	default:
+		return display.ViewNormal
+	}
+}
+
+func selectTimestampMode(options cliOptions) display.TSMode {
+	switch {
+	case options.dateTime:
+		return display.TSDateTime
+	case options.deltaTime:
+		return display.TSDelta
+	case options.unixTime:
+		return display.TSUnix
+	case options.noTimestamp:
+		return display.TSNone
+	default:
+		return display.TSDefault
+	}
+}
+
+func configureDisplay(output io.Writer, lineBuffered bool, color string) error {
+	bufferSize := 256 * 1024
+	if lineBuffered {
+		bufferSize = 0
+	}
+	if err := display.SetOutput(output, bufferSize); err != nil {
+		return fmt.Errorf("configure output: %w", err)
+	}
+	switch color {
+	case "always":
+		display.UseColor = true
+	case "never":
+		display.UseColor = false
+	default:
+		display.UseColor = isTerminal(output)
+	}
+	return nil
+}
+
+func isTerminal(writer io.Writer) bool {
+	file, ok := writer.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func readFilterFile(path string) (string, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // path is supplied explicitly by the user
+	if err != nil {
+		return "", fmt.Errorf("read BPF filter file %q: %w", path, err)
+	}
+	lines := make([]string, 0)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	filter := strings.Join(lines, " ")
+	if filter == "" {
+		return "", fmt.Errorf("BPF filter file %q is empty", path)
+	}
+	return filter, nil
+}
+
+func printUsage(writer io.Writer) {
+	_, _ = fmt.Fprint(writer, `Usage: tcpdump_go [options] [BPF expression]
+
+Sources:
+  -i interface       capture from an interface (name or -D number)
+  -r file            read classic pcap or pcapng (- for stdin)
+  -D                 list interfaces and exit
+  -F file            read BPF expression from file
+  -c N               stop after N matching packets
+
+Raw output:
+  -w file            write packets (default: do not print; - is stdout)
+  --print            also print summaries with -w
+  --pcapng           write pcapng and preserve mixed link types
+  -C N               rotate classic pcap after N million bytes
+  -G N               rotate classic pcap every N seconds
+  -W N               limit rotation to N files (cyclic with -C, stop with -G)
+  -U                 flush each raw packet to storage
+
+Presentation:
+  -q                 quick output (tcpdump semantics; not silent)
+  -v, -vv, -vvv      verbose protocol details; more detail each level
+  -A                 ASCII; -x/-X hex; -xx/-XX include link header
+  -e                 print link-layer header
+  -S                 absolute TCP sequence numbers
+  -# / --number      print packet numbers
+  -t/-tt/-ttt/-tttt  timestamp modes
+  -n/-nn             disable name resolution
+  -f                 print foreign addresses numerically
+  -l                 flush text output after every packet
+
+Capture and extensions:
+  -s N               snapshot length (default 262144)
+  -B N               kernel buffer in KiB
+  -p                 disable promiscuous mode
+  -Z user            drop privileges to user once the source is open
+  --immediate-mode   deliver packets as they arrive (default; =false buffers)
+  --disable-offload  temporarily disable and restore Linux NIC offloads
+  --stats            extended session statistics
+  --stats-only       statistics without packet lines
+  --count            count matching packets
+  --csv file         aggregate offline flows
+  --color mode       auto, always, or never
+  --version          print version and exit
+
+Legacy aliases (the tcpdump spellings above are preferred):
+  --filter expr      BPF expression; use the positional form instead
+  --promisc          promiscuous mode, on by default; -p turns it off
+  --rotate-size N    rotate the -w file after N bytes (-C uses millions)
+  --rotate-time N    rotate the -w file every N seconds (same as -G)
+`)
+}
+
+func versionString() string {
+	version := "devel"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+	}
+	return "tcpdump_go " + version + " (Go " + strings.TrimPrefix(runtimeVersion(), "go") + ")"
+}
+
+var runtimeVersion = runtime.Version

@@ -2,7 +2,10 @@
 package display
 
 import (
+	"bytes"
+	"io"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +92,7 @@ func TestAppendOffset_Values(t *testing.T) {
 		off  int
 		want string
 	}{
-		{0, "0000"}, {16, "0010"}, {255, "00ff"}, {4096, "1000"}, {65535, "ffff"},
+		{0, "0000"}, {16, "0010"}, {255, "00ff"}, {4096, "1000"}, {65535, "ffff"}, {65536, "10000"},
 	} {
 		got := string(AppendOffset(nil, tc.off))
 		if got != tc.want {
@@ -106,8 +109,8 @@ func TestPrintHex_Output(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
 	data := []byte{0x00, 0x01, 0x02, 0xff}
-	PrintHex(data)
-	FlushOut()
+	mustWrite(t, PrintHex(data))
+	mustWrite(t, FlushOut())
 	out := buf.String()
 	if !strings.Contains(out, "0000") {
 		t.Errorf("offset 0000 missing: %q", out)
@@ -120,8 +123,8 @@ func TestPrintHex_Output(t *testing.T) {
 func TestPrintHexASCII_ContainsPipe(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
-	PrintHexASCII([]byte("Hello!"))
-	FlushOut()
+	mustWrite(t, PrintHexASCII([]byte("Hello!")))
+	mustWrite(t, FlushOut())
 	if !strings.Contains(buf.String(), "|") {
 		t.Errorf("separator '|' missing: %q", buf.String())
 	}
@@ -130,8 +133,8 @@ func TestPrintHexASCII_ContainsPipe(t *testing.T) {
 func TestPrintHex_Empty(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
-	PrintHex([]byte{})
-	FlushOut()
+	mustWrite(t, PrintHex([]byte{}))
+	mustWrite(t, FlushOut())
 	if buf.Len() != 0 {
 		t.Errorf("empty data should not produce output: %q", buf.String())
 	}
@@ -144,8 +147,8 @@ func TestPrintHexASCII_MultiLine(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i + 0x40) // @ABCDE...
 	}
-	PrintHexASCII(data)
-	FlushOut()
+	mustWrite(t, PrintHexASCII(data))
+	mustWrite(t, FlushOut())
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	if len(lines) != 2 {
 		t.Errorf("32 bytes = 2 rows, got %d", len(lines))
@@ -215,12 +218,12 @@ func TestTCPFlagsShort_All(t *testing.T) {
 		want string
 	}{
 		{"SYN", layers.TCP{SYN: true}, "S"},
-		{"SA", layers.TCP{SYN: true, ACK: true}, "SA"},
-		{"AP", layers.TCP{ACK: true, PSH: true}, "AP"},
-		{"AF", layers.TCP{ACK: true, FIN: true}, "AF"},
+		{"SA", layers.TCP{SYN: true, ACK: true}, "S."},
+		{"AP", layers.TCP{ACK: true, PSH: true}, "P."},
+		{"AF", layers.TCP{ACK: true, FIN: true}, "F."},
 		{"R", layers.TCP{RST: true}, "R"},
-		{"none", layers.TCP{}, "."},
-		{"all", layers.TCP{SYN: true, ACK: true, FIN: true, RST: true, PSH: true, URG: true}, "SAFRPU"},
+		{"none", layers.TCP{}, "none"},
+		{"all", layers.TCP{SYN: true, ACK: true, FIN: true, RST: true, PSH: true, URG: true}, "FSRP.U"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tcp := tc.tcp
@@ -264,6 +267,11 @@ func TestTCPOptionsStr_MSS(t *testing.T) {
 // =============================================================================
 
 func TestFormatTS_Modes(t *testing.T) {
+	// Pin the render zone rather than time.Local: the latter is read by every
+	// time.Now() in the process and races with background goroutines.
+	oldZone := displayZone
+	displayZone = time.UTC
+	defer func() { displayZone = oldZone }()
 	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
 	prev := time.Date(2024, 6, 15, 12, 30, 44, 0, time.UTC)
 	for _, tc := range []struct {
@@ -329,8 +337,8 @@ func TestResolveIP_CacheConsistency(t *testing.T) {
 func TestCaptureOut_Redirects(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
-	Outf("hello %d", 42)
-	FlushOut()
+	mustWrite(t, Outf("hello %d", 42))
+	mustWrite(t, FlushOut())
 	if !strings.Contains(buf.String(), "hello 42") {
 		t.Errorf("CaptureOut did not capture output: %q", buf.String())
 	}
@@ -344,8 +352,8 @@ func TestPrintNormal_TCP_Output(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
 	pkt := decode(buildTCPPacket("192.168.1.1", "8.8.8.8", 12345, 80, true, false))
-	PrintNormal(1, pkt, "10:00:00.000000", true)
-	FlushOut()
+	mustWrite(t, PrintNormal(1, pkt, "10:00:00.000000", true))
+	mustWrite(t, FlushOut())
 	out := buf.String()
 	if !strings.Contains(out, "192.168.1.1") || !strings.Contains(out, "12345") || !strings.Contains(out, "80") {
 		t.Errorf("brak wymaganych danych: %q", out)
@@ -356,8 +364,8 @@ func TestPrintNormal_ARP_Output(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
 	pkt := decode(buildARPPacket("192.168.1.1", "192.168.1.2", "aa:bb:cc:dd:ee:ff"))
-	PrintNormal(1, pkt, "10:00:00.000000", true)
-	FlushOut()
+	mustWrite(t, PrintNormal(1, pkt, "10:00:00.000000", true))
+	mustWrite(t, FlushOut())
 	out := buf.String()
 	if !strings.Contains(out, "ARP") || !strings.Contains(out, "Request") {
 		t.Errorf("ARP output: %q", out)
@@ -368,8 +376,8 @@ func TestPrintVerbose_TCP_ShowsIPMeta(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
 	pkt := decode(buildTCPPacket("10.0.0.1", "10.0.0.2", 1234, 443, true, false))
-	PrintVerbose(1, pkt, "10:00:00.000000", true)
-	FlushOut()
+	mustWrite(t, PrintVerbose(1, pkt, "10:00:00.000000", 1, true))
+	mustWrite(t, FlushOut())
 	out := buf.String()
 	for _, want := range []string{"tos", "ttl", "Flags", "seq"} {
 		if !strings.Contains(out, want) {
@@ -382,8 +390,8 @@ func TestPrintVerbose_UDP_ShowsProto(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()
 	pkt := decode(buildUDPPacket("10.0.0.1", "10.0.0.2", 12345, 53))
-	PrintVerbose(1, pkt, "10:00:00.000000", true)
-	FlushOut()
+	mustWrite(t, PrintVerbose(1, pkt, "10:00:00.000000", 1, true))
+	mustWrite(t, FlushOut())
 	out := buf.String()
 	if !strings.Contains(out, "proto UDP") {
 		t.Errorf("brak 'proto UDP': %q", out)
@@ -408,11 +416,87 @@ func TestPrintPacket_AllViewModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := CaptureOut()
 			defer restore()
-			PrintPacket(1, pkt, ts, time.Time{}, tc.mode, TSDefault, false, true)
-			FlushOut()
+			mustWrite(t, PrintPacket(1, pkt, ts, time.Time{}, tc.mode, TSDefault, 0, true))
+			mustWrite(t, FlushOut())
 			if !strings.Contains(buf.String(), tc.want) {
 				t.Errorf("mode=%v: brak %q w %q", tc.mode, tc.want, buf.String())
 			}
 		})
+	}
+}
+
+// mustWrite fails the test when a display write reports an error, which is how
+// a full pipe or a closed stdout would show up.
+func mustWrite(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("display write: %v", err)
+	}
+}
+
+// A run that never resolves a name must not start the resolver pool: -n, -w
+// and --version are the common cases and they should stay goroutine-free.
+func TestDNSWorkersStayIdleUntilFirstLookup(t *testing.T) {
+	before := runtime.NumGoroutine()
+	buf, restore := CaptureOut()
+	defer restore()
+	mustWrite(t, Outf("no lookups here\n"))
+	mustWrite(t, FlushOut())
+	if buf.Len() == 0 {
+		t.Fatal("nothing was written")
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutines grew from %d to %d without a lookup", before, after)
+	}
+}
+
+// Two printers must not share output or per-flow state. Before Printer existed
+// this was impossible: everything hung off package globals, so a second
+// session in the same process would corrupt the first.
+func TestPrintersAreIndependent(t *testing.T) {
+	first := &bytes.Buffer{}
+	second := &bytes.Buffer{}
+	a := NewPrinter(first, 0)
+	b := NewPrinter(second, 0)
+
+	a.Configure(RenderOptions{NumericPorts: true})
+	b.Configure(RenderOptions{ShowPacketNumber: true})
+
+	mustWrite(t, a.Outf("from a\n"))
+	mustWrite(t, b.Outf("from b\n"))
+	mustWrite(t, a.Flush())
+	mustWrite(t, b.Flush())
+
+	if first.String() != "from a\n" {
+		t.Fatalf("printer a wrote %q", first.String())
+	}
+	if second.String() != "from b\n" {
+		t.Fatalf("printer b wrote %q", second.String())
+	}
+	if !a.renderOptions().NumericPorts || a.renderOptions().ShowPacketNumber {
+		t.Fatalf("printer a options leaked: %+v", a.renderOptions())
+	}
+	if b.renderOptions().NumericPorts || !b.renderOptions().ShowPacketNumber {
+		t.Fatalf("printer b options leaked: %+v", b.renderOptions())
+	}
+}
+
+// Relative TCP sequence bases belong to one session, not to the package.
+func TestPrinterSequenceStateIsPerPrinter(t *testing.T) {
+	a := NewPrinter(io.Discard, 0)
+	b := NewPrinter(io.Discard, 0)
+	tcp := &layers.TCP{SrcPort: 1000, DstPort: 80, Seq: 5000, Ack: 9000, ACK: true}
+
+	// The first ACK establishes the base and still prints absolute numbers.
+	if seq, _ := a.tcpSequenceNumbers("10.0.0.1", "10.0.0.2", tcp); seq != 5000 {
+		t.Fatalf("first sequence on a = %d, want the absolute 5000", seq)
+	}
+	next := &layers.TCP{SrcPort: 1000, DstPort: 80, Seq: 5100, Ack: 9000, ACK: true}
+	if seq, _ := a.tcpSequenceNumbers("10.0.0.1", "10.0.0.2", next); seq != 100 {
+		t.Fatalf("relative sequence on a = %d, want 100", seq)
+	}
+	// b never saw the flow, so it must still print absolute numbers.
+	if seq, _ := b.tcpSequenceNumbers("10.0.0.1", "10.0.0.2", next); seq != 5100 {
+		t.Fatalf("printer b returned %d: sequence state leaked between printers", seq)
 	}
 }

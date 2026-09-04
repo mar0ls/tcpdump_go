@@ -93,10 +93,10 @@ func TestUpdate_TCP(t *testing.T) {
 	if s.Bytes == 0 {
 		t.Error("Bytes = 0")
 	}
-	if cnt := s.SrcIPCount["192.168.1.1"]; cnt != 1 {
+	if cnt := s.SrcIPCount[ipEndpoint("192.168.1.1")]; cnt != 1 {
 		t.Errorf("SrcIPCount = %d", cnt)
 	}
-	if cnt := s.DstPortCount["80"]; cnt != 1 {
+	if cnt := s.DstPortCount[80]; cnt != 1 {
 		t.Errorf("DstPortCount = %d", cnt)
 	}
 }
@@ -107,7 +107,7 @@ func TestUpdate_UDP(t *testing.T) {
 	if s.UDP != 1 {
 		t.Errorf("UDP = %d", s.UDP)
 	}
-	if s.DstPortCount["53"] != 1 {
+	if s.DstPortCount[53] != 1 {
 		t.Error("no port 53")
 	}
 }
@@ -175,11 +175,11 @@ func TestUpdate_MultipleSrcIPs(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		s.Update(buildTCPPkt("10.0.0.99", "10.0.0.2", 2000, 80, false, true))
 	}
-	if s.SrcIPCount["10.0.0.1"] != 5 {
-		t.Errorf("10.0.0.1 = %d", s.SrcIPCount["10.0.0.1"])
+	if s.SrcIPCount[ipEndpoint("10.0.0.1")] != 5 {
+		t.Errorf("10.0.0.1 = %d", s.SrcIPCount[ipEndpoint("10.0.0.1")])
 	}
-	if s.SrcIPCount["10.0.0.99"] != 3 {
-		t.Errorf("10.0.0.99 = %d", s.SrcIPCount["10.0.0.99"])
+	if s.SrcIPCount[ipEndpoint("10.0.0.99")] != 3 {
+		t.Errorf("10.0.0.99 = %d", s.SrcIPCount[ipEndpoint("10.0.0.99")])
 	}
 }
 
@@ -238,8 +238,8 @@ func TestPrint_Smoke(t *testing.T) {
 	s.Update(buildARPPkt("10.0.0.3", "10.0.0.4"))
 	buf, restore := display.CaptureOut()
 	defer restore()
-	s.Print()
-	display.FlushOut()
+	mustWrite(t, s.Print())
+	mustWrite(t, display.FlushOut())
 	out := buf.String()
 	for _, want := range []string{"Session", "TCP", "UDP", "ARP", "Packets"} {
 		if !strings.Contains(out, want) {
@@ -254,9 +254,67 @@ func TestPrint_WithDropped(t *testing.T) {
 	s.Dropped.Store(42)
 	buf, restore := display.CaptureOut()
 	defer restore()
-	s.Print()
-	display.FlushOut()
+	mustWrite(t, s.Print())
+	mustWrite(t, display.FlushOut())
 	if !strings.Contains(buf.String(), "42") {
 		t.Error("should show Dropped=42")
+	}
+}
+
+// mustWrite fails the test when writing the summary reports an error.
+func mustWrite(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("write statistics: %v", err)
+	}
+}
+
+// ipEndpoint builds the map key the counters use, so tests can look an address
+// up without reaching into gopacket's internals.
+func ipEndpoint(address string) gopacket.Endpoint {
+	return layers.NewIPEndpoint(net.ParseIP(address))
+}
+
+// The address table must stay bounded: a long capture on a busy link would
+// otherwise let SrcIPCount grow until the process runs out of memory.
+func TestSrcAddressTableIsBounded(t *testing.T) {
+	s := NewStats()
+	for i := range maxTrackedSrcIPs + 500 {
+		address := net.IPv4(byte(i>>24), byte(i>>16), byte(i>>8), byte(i))
+		s.countSrc(layers.NewIPEndpoint(address))
+	}
+	if len(s.SrcIPCount) > maxTrackedSrcIPs {
+		t.Fatalf("tracked %d addresses, want at most %d", len(s.SrcIPCount), maxTrackedSrcIPs)
+	}
+	if s.UntrackedSrcIPs == 0 {
+		t.Fatal("packets past the limit were dropped without being counted")
+	}
+	if total := uint64(len(s.SrcIPCount)) + s.UntrackedSrcIPs; total != maxTrackedSrcIPs+500 {
+		t.Fatalf("tracked + untracked = %d, want %d", total, maxTrackedSrcIPs+500)
+	}
+}
+
+// Already-known addresses keep counting after the table is full.
+func TestKnownAddressesStillCountWhenTableIsFull(t *testing.T) {
+	s := NewStats()
+	known := ipEndpoint("10.0.0.1")
+	s.countSrc(known)
+	for i := range maxTrackedSrcIPs + 10 {
+		s.countSrc(layers.NewIPEndpoint(net.IPv4(10, byte(i>>16), byte(i>>8), byte(i))))
+	}
+	s.countSrc(known)
+	if got := s.SrcIPCount[known]; got < 2 {
+		t.Fatalf("count for a known address = %d, want it to keep incrementing", got)
+	}
+}
+
+// Counting must not allocate: it runs once per captured packet.
+func BenchmarkUpdate(b *testing.B) {
+	packet := buildTCPPkt("10.0.0.1", "10.0.0.2", 1234, 80, false, true)
+	s := NewStats()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		s.Update(packet)
 	}
 }

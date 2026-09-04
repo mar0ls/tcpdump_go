@@ -1,33 +1,39 @@
-version: 2
+version: "2"
+
 run:
   timeout: 3m
+
 linters:
   enable:
-    - govet
-    - staticcheck
     - errcheck
-    - ineffassign
-    - revive
-    - unconvert
     - gocritic
     - gosec
+    - govet
+    - ineffassign
     - nolintlint
+    - revive
+    - staticcheck
+    - unconvert
+  settings:
+    revive:
+      severity: warning
+    gocritic:
+      enabled-checks:
+        # appendAssign is on by default; only the opt-in check is listed here.
+        - boolExprSimplify
+  exclusions:
+    # Keep the default exclusion presets off: this project reports its errors.
+    presets: []
+    paths:
+      - "^generated_.*\\.go$"
+    rules:
+      # Test fixtures build paths at run time and create scratch directories;
+      # G301/G304/G115 there are about the fixtures, not about the tool.
+      - path: "_test\\.go$"
+        linters:
+          - gosec
+
 formatters:
   enable:
     - gofumpt
     - goimports
-issues:
-  exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude-rules:
-    - path: "^generated_.*\\.go$"
-      linters:
-        - all
-linters-settings:
-  revive:
-    severity: warning
-  gocritic:
-    enabled-checks:
-      - appendAssign
-      - boolExprSimplify

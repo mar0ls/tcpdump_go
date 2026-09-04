@@ -2,9 +2,13 @@
 
 package capture
 
-import "log"
+import (
+	"fmt"
+	"runtime"
+)
 
-// DisableOffloading is a no-op on non-Linux platforms; logs a warning.
-func DisableOffloading(iface string) {
-	log.Printf("Warning: -disable-offload supported only on Linux (ignoring for %s)", iface)
+// DisableOffloading is explicit on unsupported systems: silently accepting
+// the option would promise a wire-faithful capture while leaving offloads on.
+func DisableOffloading(iface string) (func() error, error) {
+	return nil, fmt.Errorf("disable-offload is not supported on %s (interface %q)", runtime.GOOS, iface)
 }
