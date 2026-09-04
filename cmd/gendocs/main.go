@@ -1,50 +1,65 @@
-// Generates docs/documentation.md from docs/documentation.tmpl.
+// Command gendocs regenerates docs/documentation.md from source and help text.
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
-	"go/build"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/template"
 )
 
 func main() {
-	root := findModRoot()
-	out := filepath.Join(root, "docs", "documentation.md")
+	if err := execute(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "gendocs: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func execute() error {
+	root, err := findModRoot()
+	if err != nil {
+		return err
+	}
+	outputPath := filepath.Join(root, "docs", "documentation.md")
 	if len(os.Args) > 1 {
-		out = os.Args[1]
+		outputPath = os.Args[1]
 	}
 
-	data := collect(root)
-	tmplPath := filepath.Join(root, "docs", "documentation.tmpl")
-	tmplBytes, err := os.ReadFile(tmplPath) //#nosec G304 -- fixed path in repo
+	data, err := collect(root)
 	if err != nil {
-		fatalf("read template: %v", err)
+		return err
 	}
-	t, err := template.New("doc").Parse(string(tmplBytes))
+	templatePath := filepath.Join(root, "docs", "documentation.tmpl")
+	templateBytes, err := os.ReadFile(templatePath) //nolint:gosec // fixed repository path
 	if err != nil {
-		fatalf("parse template: %v", err)
+		return fmt.Errorf("read template: %w", err)
 	}
-
-	var buf bytes.Buffer
-	if err := t.Execute(&buf, data); err != nil {
-		fatalf("execute template: %v", err)
+	documentTemplate, err := template.New("documentation").Parse(string(templateBytes))
+	if err != nil {
+		return fmt.Errorf("parse template: %w", err)
 	}
-	if err := os.WriteFile(out, buf.Bytes(), 0o644); err != nil { //#nosec G306,G703 -- out is derived from repo path or CLI arg
-		fatalf("write %s: %v", out, err)
+	var document bytes.Buffer
+	if err := documentTemplate.Execute(&document, data); err != nil {
+		return fmt.Errorf("render documentation: %w", err)
 	}
-	fmt.Printf("wrote %s (%d lines)\n", out, bytes.Count(buf.Bytes(), []byte("\n")))
+	if err := atomicWrite(outputPath, document.Bytes()); err != nil {
+		return err
+	}
+	_, err = fmt.Printf("wrote %s (%d lines)\n", outputPath, bytes.Count(document.Bytes(), []byte("\n")))
+	return err
 }
 
 type docData struct {
 	Module        string
 	GoVersion     string
-	GitRev        string
+	Toolchain     string
 	Flags         string
 	Packages      []pkgDoc
 	PlatformFiles []platformFile
@@ -70,171 +85,330 @@ type codeMetrics struct {
 	Comments int
 }
 
-func collect(root string) docData {
-	return docData{
-		Module:        readGoMod(root, "module"),
-		GoVersion:     readGoMod(root, "go"),
-		GitRev:        run(root, "git", "rev-parse", "--short", "HEAD"),
-		Flags:         cliFlags(root),
-		Packages:      subpackageDocs(root),
-		PlatformFiles: platformFiles(root),
-		Deps:          dependencies(root),
-		Metrics:       metrics(root),
-	}
-}
-
-func cliFlags(root string) string {
-	binary, err := os.MkdirTemp("", "gendocs_bin_")
+func collect(root string) (docData, error) {
+	module, err := readGoMod(root, "module")
 	if err != nil {
-		return ""
+		return docData{}, err
 	}
-	defer func() { _ = os.RemoveAll(binary) }()
-	bin := filepath.Join(binary, "tcpdump_go")
-	if out, err := exec.Command("go", "build", "-o", bin, root).CombinedOutput(); err != nil { //#nosec G204
-		return strings.TrimSpace(string(out))
+	goVersion, err := readGoMod(root, "go")
+	if err != nil {
+		return docData{}, err
 	}
-	cmd := exec.Command(bin, "-h") //#nosec G204
-	cmd.Dir = root
-	out, _ := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out))
+	toolchain, err := readGoMod(root, "toolchain")
+	if err != nil {
+		return docData{}, err
+	}
+	flags, err := cliFlags(root)
+	if err != nil {
+		return docData{}, err
+	}
+	packages, err := subpackageDocs(root)
+	if err != nil {
+		return docData{}, err
+	}
+	platforms, err := platformFiles(root)
+	if err != nil {
+		return docData{}, err
+	}
+	deps, err := dependencies(root, module)
+	if err != nil {
+		return docData{}, err
+	}
+	metrics, err := sourceMetrics(root)
+	if err != nil {
+		return docData{}, err
+	}
+	return docData{
+		Module:        module,
+		GoVersion:     goVersion,
+		Toolchain:     toolchain,
+		Flags:         flags,
+		Packages:      packages,
+		PlatformFiles: platforms,
+		Deps:          deps,
+		Metrics:       metrics,
+	}, nil
 }
 
-func subpackageDocs(root string) []pkgDoc {
-	entries, _ := os.ReadDir(root)
+func cliFlags(root string) (result string, retErr error) {
+	directory, err := os.MkdirTemp("", "gendocs-bin-")
+	if err != nil {
+		return "", fmt.Errorf("create build directory: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, os.RemoveAll(directory))
+	}()
+	binary := filepath.Join(directory, "tcpdump_go")
+	if _, err := runCommand(root, "go", "build", "-o", binary, "."); err != nil {
+		return "", err
+	}
+	output, err := runCommand(root, binary, "-h")
+	if err != nil {
+		return "", err
+	}
+	return output, nil
+}
+
+func subpackageDocs(root string) ([]pkgDoc, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("list repository: %w", err)
+	}
 	var result []pkgDoc
-	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || e.Name() == "cmd" || e.Name() == "docs" || e.Name() == "testdata" {
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || entry.Name() == "cmd" || entry.Name() == "docs" || entry.Name() == "testdata" {
 			continue
 		}
-		goFiles, _ := filepath.Glob(filepath.Join(root, e.Name(), "*.go"))
+		goFiles, err := filepath.Glob(filepath.Join(root, entry.Name(), "*.go"))
+		if err != nil {
+			return nil, fmt.Errorf("find Go files in %s: %w", entry.Name(), err)
+		}
 		if len(goFiles) == 0 {
 			continue
 		}
-		doc := run(root, "go", "doc", "-all", "./"+e.Name())
-		if doc != "" {
-			result = append(result, pkgDoc{Name: e.Name(), Doc: doc})
+		// Pinned GOOS: package docs contain build-tagged declarations, so the
+		// output would otherwise depend on the machine running the generator
+		// and the committed file could never match CI.
+		documentation, err := runCommandForOS(root, docsGOOS, "go", "doc", "-all", "./"+entry.Name())
+		if err != nil {
+			return nil, err
 		}
+		result = append(result, pkgDoc{Name: entry.Name(), Doc: documentation})
 	}
-	return result
+	return result, nil
 }
 
-func platformFiles(root string) []platformFile {
-	candidates := []string{
-		"capture/signals_unix.go",
-		"capture/signals_windows.go",
-		"capture/offload_linux.go",
-		"capture/offload_other.go",
+// platformFiles discovers every build-tagged source rather than listing them.
+// A hardcoded list silently goes stale the moment a platform file is added.
+func platformFiles(root string) ([]platformFile, error) {
+	candidates, err := findBuildTaggedFiles(root)
+	if err != nil {
+		return nil, err
 	}
-	var result []platformFile
-	for _, rel := range candidates {
-		path := filepath.Join(root, rel)
-		data, err := os.ReadFile(path) //#nosec G304 -- fixed paths in repo
+	result := make([]platformFile, 0, len(candidates))
+	for _, relative := range candidates {
+		path := filepath.Join(root, relative)
+		data, err := os.ReadFile(path) //nolint:gosec // path was discovered inside the repository
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read platform source %s: %w", relative, err)
 		}
-		tag, desc := "", ""
-		sc := bufio.NewScanner(bytes.NewReader(data))
-		for sc.Scan() {
-			line := sc.Text()
+		tag, description := "", ""
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		for scanner.Scan() {
+			line := scanner.Text()
 			if strings.HasPrefix(line, "//go:build ") && tag == "" {
 				tag = strings.TrimPrefix(line, "//go:build ")
 			}
-			if strings.HasPrefix(line, "// ") && desc == "" && !strings.Contains(line, "go:build") && !strings.Contains(line, "Package") {
-				desc = strings.TrimPrefix(line, "// ")
+			if strings.HasPrefix(line, "// ") && description == "" && !strings.Contains(line, "go:build") && !strings.Contains(line, "Package") {
+				description = strings.TrimPrefix(line, "// ")
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("scan platform source %s: %w", relative, err)
 		}
 		if tag == "" {
 			tag = "—"
 		}
-		if desc == "" {
-			desc = "—"
+		if description == "" {
+			description = "—"
 		}
-		result = append(result, platformFile{File: filepath.Base(path), Tag: tag, Desc: desc})
+		result = append(result, platformFile{File: filepath.Base(path), Tag: tag, Desc: description})
 	}
-	return result
+	return result, nil
 }
 
-func dependencies(root string) string {
-	module := readGoMod(root, "module")
-	out := run(root, "go", "list", "-m", "all")
-	var lines []string
-	for _, l := range strings.Split(out, "\n") {
-		if l != "" && !strings.HasPrefix(l, module) {
-			lines = append(lines, l)
+// findBuildTaggedFiles returns the repository-relative paths of non-test Go
+// files carrying a //go:build constraint, sorted for a stable document.
+func findBuildTaggedFiles(root string) ([]string, error) {
+	var found []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-func metrics(root string) codeMetrics {
-	var m codeMetrics
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if entry.IsDir() {
+			if path != root && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "testdata") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path) //nolint:gosec // path is discovered inside the repository
+		if err != nil {
 			return err
+		}
+		if !bytes.HasPrefix(data, []byte("//go:build ")) {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		found = append(found, filepath.ToSlash(relative))
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("find build-tagged sources: %w", err)
+	}
+	sort.Strings(found)
+	return found, nil
+}
+
+func dependencies(root, module string) (string, error) {
+	output, err := runCommand(root, "go", "list", "-m", "all")
+	if err != nil {
+		return "", err
+	}
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if line != "" && !strings.HasPrefix(line, module+" ") && line != module {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func sourceMetrics(root string) (codeMetrics, error) {
+	var metrics codeMetrics
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != root && (strings.HasPrefix(entry.Name(), ".") || entry.Name() == "testdata") {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		data, err := os.ReadFile(path) //#nosec G304,G122 -- walking own source tree
+		data, err := os.ReadFile(path) //nolint:gosec // path is discovered inside the repository
 		if err != nil {
-			return nil
+			return err
 		}
-		m.Files++
+		metrics.Files++
 		for _, line := range strings.Split(string(data), "\n") {
-			m.Total++
-			stripped := strings.TrimSpace(line)
+			metrics.Total++
+			trimmed := strings.TrimSpace(line)
 			switch {
-			case strings.HasPrefix(stripped, "//"):
-				m.Comments++
-			case stripped != "":
-				m.Code++
+			case strings.HasPrefix(trimmed, "//"):
+				metrics.Comments++
+			case trimmed != "":
+				metrics.Code++
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return m
+		return codeMetrics{}, fmt.Errorf("measure source tree: %w", err)
 	}
-	return m
+	return metrics, nil
 }
 
-func readGoMod(root, key string) string {
-	data, err := os.ReadFile(filepath.Join(root, "go.mod")) //#nosec G304 -- fixed path
+func readGoMod(root, key string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(root, "go.mod")) //nolint:gosec // fixed repository path
 	if err != nil {
-		return "?"
+		return "", fmt.Errorf("read go.mod: %w", err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, key+" ") {
-			return strings.Fields(line)[1]
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				return fields[1], nil
+			}
 		}
 	}
-	return "?"
+	return "", fmt.Errorf("go.mod has no %q directive", key)
 }
 
-func run(dir string, name string, args ...string) string {
-	cmd := exec.Command(name, args...) //#nosec G204
-	cmd.Dir = dir
-	out, _ := cmd.Output()
-	return strings.TrimSpace(string(out))
+// runCommand runs a build-time helper. The executable is resolved to an
+// absolute path first and the process is built from that path directly, so no
+// name is ever handed to a lookup that could pick up something else.
+// docsGOOS is the platform the package documentation is rendered for. Linux is
+// the project's primary target and what CI runs.
+const docsGOOS = "linux"
+
+func runCommand(directory, name string, args ...string) (string, error) {
+	return runCommandForOS(directory, "", name, args...)
 }
 
-func findModRoot() string {
-	dir, _ := os.Getwd()
+// runCommandForOS runs a helper with GOOS pinned when goos is non-empty.
+func runCommandForOS(directory, goos, name string, args ...string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return "", fmt.Errorf("find %s: %w", name, err)
+	}
+	// #nosec G204 -- path is resolved with exec.LookPath and is then used directly,
+	// so the command is not selected from an untrusted PATH lookup.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	command := exec.Command(name, args...)
+	command.Path = path
+	command.Dir = directory
+	if goos != "" {
+		command.Env = append(os.Environ(), "GOOS="+goos)
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("run %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func findModRoot() (string, error) {
+	directory, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
+		if _, err := os.Stat(filepath.Join(directory, "go.mod")); err == nil {
+			return directory, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("inspect %s: %w", directory, err)
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return "", errors.New("could not find a parent directory containing go.mod")
 		}
-		dir = parent
+		directory = parent
 	}
-	// fallback: GOPATH
-	return build.Default.GOPATH
 }
 
-func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "gendocs: "+format+"\n", args...)
-	os.Exit(1)
+func atomicWrite(path string, data []byte) (retErr error) {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".documentation.tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary documentation: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	closed := false
+	renamed := false
+	defer func() {
+		if !closed {
+			retErr = errors.Join(retErr, temporary.Close())
+		}
+		if !renamed {
+			//nolint:gosec // temporaryPath comes from os.CreateTemp in this function
+			if err := os.Remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				retErr = errors.Join(retErr, err)
+			}
+		}
+	}()
+	if err := temporary.Chmod(0o644); err != nil {
+		return fmt.Errorf("set documentation permissions: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return fmt.Errorf("write documentation: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close documentation: %w", err)
+	}
+	closed = true
+	//nolint:gosec // both paths are chosen by this generator, not by input
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("publish documentation: %w", err)
+	}
+	renamed = true
+	return nil
 }

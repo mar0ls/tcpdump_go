@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"tcpdump_go/display"
-	"tcpdump_go/rotation"
-	"tcpdump_go/stats"
+	"tcpdump_go/internal/pathguard"
+	"tcpdump_go/offline"
 	"testing"
 	"time"
 
@@ -19,908 +21,609 @@ import (
 	"github.com/gopacket/gopacket/pcapgo"
 )
 
-// TestMain creates test fixtures and builds the test binary before running the entire suite.
+var testFixturePath string
+
 func TestMain(m *testing.M) {
-	if err := os.MkdirAll("testdata", 0o750); err != nil { //#nosec G301 -- test directory
+	directory, err := os.MkdirTemp("", "tcpdump-go-tests-")
+	if err != nil {
 		panic(err)
 	}
-	createTestPcap("testdata/test.pcap")
+	testFixturePath = filepath.Join(directory, "fixture.pcap")
+	createTestPcap(testFixturePath)
 
-	// Build the binary once — used by comparison tests (tcpdump_go vs tcpdump).
-	dir, err := os.MkdirTemp("", "tcpdump_go_bin_")
-	if err == nil {
-		compareBinaryDir = dir
-		compareBinaryPath = filepath.Join(dir, "tcpdump_go")
-		cmd := exec.Command("go", "build", "-o", compareBinaryPath, ".") //#nosec G204
-		if out, buildErr := cmd.CombinedOutput(); buildErr != nil {
-			fmt.Fprintf(os.Stderr, "WARN: could not build comparison binary: %v\n%s\n", buildErr, out)
-			compareBinaryPath = ""
-		}
+	compareBinaryDir = directory
+	compareBinaryPath = filepath.Join(directory, "tcpdump_go")
+	command := exec.Command("go", "build", "-o", compareBinaryPath, ".")
+	if output, buildErr := command.CombinedOutput(); buildErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "comparison binary unavailable: %v\n%s", buildErr, output)
+		compareBinaryPath = ""
 	}
 
 	code := m.Run()
-	if compareBinaryDir != "" {
-		_ = os.RemoveAll(compareBinaryDir)
-	}
+	_ = os.RemoveAll(directory)
 	os.Exit(code)
 }
 
-// createTestPcap writes a minimal pcap file with one TCP and one UDP packet.
-func createTestPcap(path string) {
-	f, err := os.Create(path) //#nosec G304 -- fixed test path
-	if err != nil {
-		panic(err)
-	}
-	defer func() { _ = f.Close() }()
-
-	w := pcapgo.NewWriter(f)
-	if err := w.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
-		panic(err)
-	}
-
-	ts := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	for _, pkt := range [][]byte{
-		buildTCPPacket("192.168.1.1", "8.8.8.8", 12345, 80, true, false),
-		buildUDPPacket("10.0.0.1", "1.1.1.1", 54321, 53),
-	} {
-		ci := gopacket.CaptureInfo{Timestamp: ts, CaptureLength: len(pkt), Length: len(pkt)}
-		if err := w.WritePacket(ci, pkt); err != nil {
-			panic(err)
-		}
-		ts = ts.Add(time.Millisecond)
+func TestExpandArgs(t *testing.T) {
+	got := expandArgs([]string{"-nXX", "-vv", "--stats-only", "-c", "2", "tcp"})
+	want := []string{"-n", "-XX", "-v", "-v", "--stats-only", "-c", "2", "tcp"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("expandArgs = %q, want %q", got, want)
 	}
 }
 
-// Helpers — raw packet construction
-
-func buildTCPPacket(srcIP, dstIP string, srcPort, dstPort uint16, syn, ack bool) []byte {
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-
-	tcp := &layers.TCP{
-		SrcPort: layers.TCPPort(srcPort),
-		DstPort: layers.TCPPort(dstPort),
-		SYN:     syn,
-		ACK:     ack,
-		Window:  65535,
-	}
-	ip := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    net.ParseIP(srcIP).To4(),
-		DstIP:    net.ParseIP(dstIP).To4(),
-	}
-	_ = tcp.SetNetworkLayerForChecksum(ip)
-	eth := &layers.Ethernet{
-		SrcMAC:       net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
-		DstMAC:       net.HardwareAddr{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-	if err := gopacket.SerializeLayers(buf, opts, eth, ip, tcp, gopacket.Payload([]byte("hello"))); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-func buildUDPPacket(srcIP, dstIP string, srcPort, dstPort uint16) []byte {
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-
-	udp := &layers.UDP{
-		SrcPort: layers.UDPPort(srcPort),
-		DstPort: layers.UDPPort(dstPort),
-	}
-	ip := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    net.ParseIP(srcIP).To4(),
-		DstIP:    net.ParseIP(dstIP).To4(),
-	}
-	_ = udp.SetNetworkLayerForChecksum(ip)
-	eth := &layers.Ethernet{
-		SrcMAC:       net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
-		DstMAC:       net.HardwareAddr{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF},
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-	if err := gopacket.SerializeLayers(buf, opts, eth, ip, udp, gopacket.Payload([]byte{0x00})); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-func decodePacket(raw []byte) gopacket.Packet {
-	return gopacket.NewPacket(raw, layers.LayerTypeEthernet, gopacket.Default)
-}
-
-func buildARPPacket(srcIP, dstIP, srcMAC string) []byte {
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true}
-
-	hw, _ := net.ParseMAC(srcMAC)
-	arp := &layers.ARP{
-		AddrType:          layers.LinkTypeEthernet,
-		Protocol:          layers.EthernetTypeIPv4,
-		HwAddressSize:     6,
-		ProtAddressSize:   4,
-		Operation:         layers.ARPRequest,
-		SourceHwAddress:   hw,
-		SourceProtAddress: net.ParseIP(srcIP).To4(),
-		DstHwAddress:      net.HardwareAddr{0, 0, 0, 0, 0, 0},
-		DstProtAddress:    net.ParseIP(dstIP).To4(),
-	}
-	eth := &layers.Ethernet{
-		SrcMAC:       hw,
-		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-		EthernetType: layers.EthernetTypeARP,
-	}
-	if err := gopacket.SerializeLayers(buf, opts, eth, arp); err != nil {
-		panic(err)
-	}
-	return buf.Bytes()
-}
-
-// openPcapFile
-
-func TestOpenPcapFile_Pcap(t *testing.T) {
-	f, reader := openPcapFile("testdata/test.pcap")
-	defer func() { _ = f.Close() }()
-
-	if reader == nil {
-		t.Fatal("reader must not be nil")
-	}
-	if reader.LinkType() != layers.LinkTypeEthernet {
-		t.Errorf("LinkType = %v, want Ethernet", reader.LinkType())
-	}
-}
-
-func TestOpenPcapFile_ReadPackets(t *testing.T) {
-	f, reader := openPcapFile("testdata/test.pcap")
-	defer func() { _ = f.Close() }()
-
-	src := gopacket.NewPacketSource(reader, reader.LinkType())
-	var count int
-	for range src.Packets() {
-		count++
-	}
-	if count != 2 {
-		t.Errorf("packet count = %d, want 2", count)
-	}
-}
-
-// writeCSV
-
-func TestWriteCSV(t *testing.T) {
-	path := t.TempDir() + "/flows.csv"
-	flowMap := map[flowKey]int{
-		{Src: "1.1.1.1", Dst: "2.2.2.2", Sport: "1234", Dport: "80", Proto: "TCP"}: 5,
-		{Src: "3.3.3.3", Dst: "4.4.4.4", Sport: "9999", Dport: "53", Proto: "UDP"}: 2,
-	}
-
-	_, restore := display.CaptureOut()
-	defer restore()
-	writeCSV(path, flowMap)
-
-	f, err := os.Open(path) //#nosec G304 -- path from t.TempDir()
-	if err != nil {
-		t.Fatalf("CSV file missing: %v", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	records, err := csv.NewReader(f).ReadAll()
-	if err != nil {
-		t.Fatalf("CSV parse error: %v", err)
-	}
-
-	if len(records) < 2 {
-		t.Fatalf("CSV has %d rows, want >= 2 (header + data)", len(records))
-	}
-
-	header := strings.Join(records[0], ",")
-	wantHeader := "src_ip,dst_ip,src_port,dst_port,proto,count"
-	if header != wantHeader {
-		t.Errorf("header = %q, want %q", header, wantHeader)
-	}
-	if len(records) != 3 {
-		t.Errorf("row count = %d, want 3", len(records))
-	}
-}
-
-// runReadPcap — integration tests
-
-func TestRunReadPcap_Normal(_ *testing.T) {
-	_, restore := display.CaptureOut()
-	defer restore()
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, "", 0)
-}
-
-func TestRunReadPcap_WithStats(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, true, false, "", 0)
-	display.FlushOut()
-
-	output := buf.String()
-	if !strings.Contains(output, "Session summary") {
-		t.Errorf("stats section not found in output")
-	}
-	if !strings.Contains(output, "TCP") {
-		t.Errorf("TCP missing from stats output")
-	}
-}
-
-func TestRunReadPcap_WithCount(t *testing.T) {
-	s := stats.NewStats()
-	f, reader := openPcapFile("testdata/test.pcap")
-	defer func() { _ = f.Close() }()
-	src := gopacket.NewPacketSource(reader, reader.LinkType())
-	var n uint64
-	for pkt := range src.Packets() {
-		n++
-		s.Update(pkt)
-		if n >= 1 {
-			break
-		}
-	}
-	if s.Total != 1 {
-		t.Errorf("with count=1 got %d packets, want 1", s.Total)
-	}
-}
-
-func TestRunReadPcap_AllViewModes(t *testing.T) {
-	modes := []struct {
+// TestExpandArgsGluedValues covers the getopt forms tcpdump users type by
+// habit, where a value is attached to its flag or trails a boolean cluster.
+func TestExpandArgsGluedValues(t *testing.T) {
+	cases := []struct {
 		name string
-		mode display.ViewMode
+		in   []string
+		want []string
 	}{
-		{"normal", display.ViewNormal},
-		{"verbose", display.ViewVerbose},
-		{"hex", display.ViewHex},
-		{"hexascii", display.ViewHexASCII},
-		{"hex_link", display.ViewHexLink},
-		{"hexascii_link", display.ViewHexASCIILink},
+		{"bool cluster then value flag", []string{"-nni", "eth0"}, []string{"-nn", "-i", "eth0"}},
+		{"glued count", []string{"-c100"}, []string{"-c", "100"}},
+		{"glued snaplen after bool", []string{"-vs96"}, []string{"-v", "-s", "96"}},
+		{"glued stdout output", []string{"-w-"}, []string{"-w", "-"}},
+		{"glued user", []string{"-Znobody"}, []string{"-Z", "nobody"}},
+		{"value flag ends cluster", []string{"-ttni", "lo0"}, []string{"-tt", "-n", "-i", "lo0"}},
+		{"path keeps its characters", []string{"-r/tmp/a.pcap"}, []string{"-r", "/tmp/a.pcap"}},
+
+		// Left alone: nothing to split, or not fully recognized.
+		{"single long flag", []string{"-tttt"}, []string{"-tttt"}},
+		{"single short flag", []string{"-XX"}, []string{"-XX"}},
+		{"explicit assignment", []string{"--immediate-mode=false"}, []string{"--immediate-mode=false"}},
+		{"unknown cluster", []string{"-zq"}, []string{"-zq"}},
+		{"bare value flag", []string{"-i"}, []string{"-i"}},
+		{"positional expression", []string{"tcp", "port", "80"}, []string{"tcp", "port", "80"}},
+		{"double dash", []string{"--"}, []string{"--"}},
 	}
-	for _, m := range modes {
-		t.Run(m.name, func(_ *testing.T) {
-			_, restore := display.CaptureOut()
-			defer restore()
-			runReadPcap("testdata/test.pcap", "", "", m.mode, display.TSDefault, false, true, false, false, "", 0)
-		})
-	}
-}
-
-func TestRunReadPcap_WithCSV(t *testing.T) {
-	csvPath := t.TempDir() + "/out.csv"
-	_, restore := display.CaptureOut()
-	defer restore()
-
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, csvPath, 0)
-
-	if _, err := os.Stat(csvPath); err != nil {
-		t.Errorf("CSV file not created: %v", err)
-	}
-}
-
-func TestRunReadPcap_DisableDNS(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, true, true, false, false, "", 0)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "192.168.1.1") && !strings.Contains(out, "10.0.0.1") {
-		t.Errorf("-n: expected raw IP in output: %q", out)
-	}
-}
-
-func TestRunReadPcap_Quiet(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, true, "", 0)
-	display.FlushOut()
-
-	if buf.Len() != 0 {
-		t.Errorf("-q: expected no output, got: %q", buf.String())
-	}
-}
-
-func TestRunReadPcap_Count(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, display.TSDefault, false, true, false, false, "", 1)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "#1") {
-		t.Errorf("-c 1: missing #1 in output: %q", out)
-	}
-	if strings.Contains(out, "#2") {
-		t.Errorf("-c 1: unexpected #2 in output: %q", out)
-	}
-}
-
-func TestRunReadPcap_TimestampModes(t *testing.T) {
-	tsModes := []struct {
-		name        string
-		mode        display.TSMode
-		mustContain string
-	}{
-		{"default", display.TSDefault, ":"},
-		{"none", display.TSNone, "#1"},
-		{"unix", display.TSUnix, "."},
-		{"delta", display.TSDelta, "."},
-		{"datetime", display.TSDateTime, "-"},
-	}
-
-	for _, tt := range tsModes {
-		t.Run(tt.name, func(t *testing.T) {
-			buf, restore := display.CaptureOut()
-			defer restore()
-			runReadPcap("testdata/test.pcap", "", "", display.ViewNormal, tt.mode, false, true, false, false, "", 0)
-			display.FlushOut()
-			got := buf.String()
-			if !strings.Contains(got, tt.mustContain) {
-				t.Errorf("tsMode=%v: want %q in %q", tt.mode, tt.mustContain, got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := expandArgs(tc.in)
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("expandArgs(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
 }
 
-// expandArgs — POSIX-style flag combining
-
-func TestExpandArgs_Combined(t *testing.T) {
-	tests := []struct {
-		input []string
-		want  []string
-	}{
-		{[]string{"-nXX"}, []string{"-n", "-XX"}},
-		{[]string{"-nx"}, []string{"-n", "-x"}},
-		{[]string{"-nX"}, []string{"-n", "-X"}},
-		{[]string{"-nv"}, []string{"-n", "-v"}},
-		{[]string{"-nvXX"}, []string{"-n", "-v", "-XX"}},
-		{[]string{"-ntttt"}, []string{"-n", "-tttt"}},
-		{[]string{"-nttt"}, []string{"-n", "-ttt"}},
-		{[]string{"-ntt"}, []string{"-n", "-tt"}},
-		{[]string{"-nt"}, []string{"-n", "-t"}},
-		{[]string{"-n", "-XX"}, []string{"-n", "-XX"}},
-		{[]string{"-r", "file.pcap"}, []string{"-r", "file.pcap"}},
-		{[]string{"tcp port 80"}, []string{"tcp port 80"}},
-		{[]string{"-XX"}, []string{"-XX"}},
-	}
-	for _, tt := range tests {
-		got := expandArgs(tt.input)
-		if len(got) != len(tt.want) {
-			t.Errorf("expandArgs(%v) = %v, want %v", tt.input, got, tt.want)
-			continue
-		}
-		for i := range got {
-			if got[i] != tt.want[i] {
-				t.Errorf("expandArgs(%v)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
-			}
-		}
-	}
-}
-
-// stats package integration tests (called from main)
-
-func TestStatsUpdate_TCP(t *testing.T) {
-	s := stats.NewStats()
-	pkt := decodePacket(buildTCPPacket("1.2.3.4", "5.6.7.8", 1234, 80, true, false))
-	s.Update(pkt)
-
-	if s.Total != 1 {
-		t.Errorf("Total = %d, want 1", s.Total)
-	}
-	if s.TCP != 1 {
-		t.Errorf("TCP = %d, want 1", s.TCP)
-	}
-}
-
-func TestStatsUpdate_UDP(t *testing.T) {
-	s := stats.NewStats()
-	pkt := decodePacket(buildUDPPacket("1.2.3.4", "5.6.7.8", 1234, 53))
-	s.Update(pkt)
-	if s.UDP != 1 {
-		t.Errorf("UDP = %d, want 1", s.UDP)
-	}
-}
-
-func TestStatsUpdate_Bytes(t *testing.T) {
-	s := stats.NewStats()
-	raw := buildTCPPacket("1.2.3.4", "5.6.7.8", 1234, 80, false, true)
-	s.Update(decodePacket(raw))
-	if s.Bytes != uint64(len(raw)) {
-		t.Errorf("Bytes = %d, want %d", s.Bytes, len(raw))
-	}
-}
-
-func TestStatsUpdate_MultiplePackets(t *testing.T) {
-	s := stats.NewStats()
-	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1000, 80, true, false)))
-	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1001, 80, false, true)))
-	s.Update(decodePacket(buildUDPPacket("3.3.3.3", "4.4.4.4", 5000, 53)))
-
-	if s.Total != 3 {
-		t.Errorf("Total = %d, want 3", s.Total)
-	}
-	if s.TCP != 2 {
-		t.Errorf("TCP = %d, want 2", s.TCP)
-	}
-	if s.UDP != 1 {
-		t.Errorf("UDP = %d, want 1", s.UDP)
-	}
-}
-
-func TestStatsUpdate_SizeMinMax(t *testing.T) {
-	s := stats.NewStats()
-	small := buildUDPPacket("1.1.1.1", "2.2.2.2", 1111, 53)
-	large := buildTCPPacket("1.1.1.1", "2.2.2.2", 2222, 80, true, false)
-	s.Update(decodePacket(small))
-	s.Update(decodePacket(large))
-
-	if s.MinSize != uint64(len(small)) {
-		t.Errorf("MinSize = %d, want %d", s.MinSize, len(small))
-	}
-	if s.MaxSize != uint64(len(large)) {
-		t.Errorf("MaxSize = %d, want %d", s.MaxSize, len(large))
-	}
-}
-
-func TestStatsUpdate_TCPFlags(t *testing.T) {
-	s := stats.NewStats()
-	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1000, 80, true, false)))
-	s.Update(decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 1000, 80, false, true)))
-
-	if s.TCPSYN != 1 {
-		t.Errorf("TCPSYN = %d, want 1", s.TCPSYN)
-	}
-}
-
-func TestStatsUpdate_TopSrcIP(t *testing.T) {
-	s := stats.NewStats()
-	for range 3 {
-		s.Update(decodePacket(buildTCPPacket("10.0.0.1", "8.8.8.8", 1234, 80, false, true)))
-	}
-	s.Update(decodePacket(buildTCPPacket("10.0.0.2", "8.8.8.8", 5678, 80, false, true)))
-
-	if s.SrcIPCount["10.0.0.1"] != 3 {
-		t.Errorf("SrcIPCount[10.0.0.1] = %d, want 3", s.SrcIPCount["10.0.0.1"])
-	}
-	top := stats.TopN(s.SrcIPCount, 1)
-	if len(top) == 0 || !strings.Contains(top[0], "10.0.0.1") {
-		t.Errorf("top sender should be 10.0.0.1, got: %v", top)
-	}
-}
-
-// display package tests (called from main)
-
-func TestTCPFlagsShort(t *testing.T) {
-	tests := []struct {
-		name string
-		tcp  layers.TCP
-		want string
-	}{
-		{"SYN", layers.TCP{SYN: true}, "S"},
-		{"SYN+ACK", layers.TCP{SYN: true, ACK: true}, "SA"},
-		{"PSH+ACK", layers.TCP{PSH: true, ACK: true}, "AP"},
-		{"FIN+ACK", layers.TCP{FIN: true, ACK: true}, "AF"},
-		{"RST", layers.TCP{RST: true}, "R"},
-		{"empty", layers.TCP{}, "."},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tcp := tt.tcp
-			got := display.TCPFlagsShort(&tcp)
-			if got != tt.want {
-				t.Errorf("TCPFlagsShort: want %q, got %q", tt.want, got)
-			}
-		})
-	}
-}
-
-func TestColorize_NoColor(t *testing.T) {
-	old := display.UseColor
-	display.UseColor = false
-	defer func() { display.UseColor = old }()
-
-	got := display.Colorize("hello", display.ColorRed)
-	if got != "hello" {
-		t.Errorf("no color: want %q, got %q", "hello", got)
-	}
-}
-
-func TestColorize_WithColor(t *testing.T) {
-	old := display.UseColor
-	display.UseColor = true
-	defer func() { display.UseColor = old }()
-
-	got := display.Colorize("hello", display.ColorRed)
-	if !strings.Contains(got, "hello") {
-		t.Errorf("result should contain original text, got %q", got)
-	}
-	if !strings.HasPrefix(got, display.ColorRed) {
-		t.Errorf("result should start with color code")
-	}
-	if !strings.HasSuffix(got, display.ColorReset) {
-		t.Errorf("result should end with color reset")
-	}
-}
-
-func TestAppendOffset(t *testing.T) {
-	tests := []struct {
-		offset int
-		want   string
-	}{
-		{0, "0000"},
-		{16, "0010"},
-		{255, "00ff"},
-		{4096, "1000"},
-		{65535, "ffff"},
-	}
-	for _, tt := range tests {
-		buf := display.AppendOffset(nil, tt.offset)
-		got := string(buf)
-		if got != tt.want {
-			t.Errorf("offset %d: want %q, got %q", tt.offset, tt.want, got)
-		}
-	}
-}
-
-func TestPrintHex_NonemptyData(_ *testing.T) {
-	_, restore := display.CaptureOut()
-	defer restore()
-	data := make([]byte, 48)
-	for i := range data {
-		data[i] = byte(i)
-	}
-	display.PrintHex(data)
-}
-
-func TestPrintHexASCII_NonemptyData(_ *testing.T) {
-	_, restore := display.CaptureOut()
-	defer restore()
-	data := []byte("Hello, World! \x00\x01\x02")
-	display.PrintHexASCII(data)
-}
-
-func TestPrintHex_EmptyData(_ *testing.T) {
-	_, restore := display.CaptureOut()
-	defer restore()
-	display.PrintHex([]byte{})
-}
-
-func TestExtractPorts_TCP(t *testing.T) {
-	pkt := decodePacket(buildTCPPacket("1.1.1.1", "2.2.2.2", 12345, 80, true, false))
-	tl := pkt.TransportLayer()
-	if tl == nil {
-		t.Fatal("transport layer missing")
-	}
-	sport, dport := display.ExtractPorts(tl)
-	if sport != "12345" {
-		t.Errorf("sport = %q, want %q", sport, "12345")
-	}
-	if dport != "80" {
-		t.Errorf("dport = %q, want %q", dport, "80")
-	}
-}
-
-func TestExtractPorts_UDP(t *testing.T) {
-	pkt := decodePacket(buildUDPPacket("1.1.1.1", "2.2.2.2", 54321, 53))
-	tl := pkt.TransportLayer()
-	if tl == nil {
-		t.Fatal("transport layer missing")
-	}
-	sport, dport := display.ExtractPorts(tl)
-	if sport != "54321" {
-		t.Errorf("sport = %q, want %q", sport, "54321")
-	}
-	if dport != "53" {
-		t.Errorf("dport = %q, want %q", dport, "53")
-	}
-}
-
-func TestResolveIP_Cache(t *testing.T) {
-	display.ClearDNSCache("240.0.0.1")
-	r1 := display.ResolveIP("240.0.0.1")
-	r2 := display.ResolveIP("240.0.0.1")
-	if r1 != r2 {
-		t.Errorf("cache returned different results: %q vs %q", r1, r2)
-	}
-}
-
-func TestResolveIP_Loopback(t *testing.T) {
-	display.ClearDNSCache("127.0.0.1")
-	result := display.ResolveIP("127.0.0.1")
-	if result == "" {
-		t.Error("resolveIP must not return empty string")
-	}
-}
-
-func TestPacketPayload_StripsEthernet(t *testing.T) {
-	raw := buildTCPPacket("1.2.3.4", "5.6.7.8", 1234, 80, true, false)
-	pkt := decodePacket(raw)
-
-	full := pkt.Data()
-	payload := display.PacketPayload(pkt)
-
-	if len(payload) >= len(full) {
-		t.Errorf("payload (%d B) should be shorter than full packet (%d B)", len(payload), len(full))
-	}
-	if len(full)-len(payload) != 14 {
-		t.Errorf("length diff = %d, want 14 (Ethernet header)", len(full)-len(payload))
-	}
-}
-
-// formatTS — tested via display.FormatTS
-
-func TestFormatTS_Default(t *testing.T) {
-	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, display.TSDefault)
-	if !strings.Contains(got, "12:30:45.123456") {
-		t.Errorf("default: want HH:MM:SS.us time, got %q", got)
-	}
-}
-
-func TestFormatTS_T(t *testing.T) {
-	ts := time.Date(2024, 6, 15, 12, 30, 45, 0, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, display.TSNone)
-	if got != "" {
-		t.Errorf("-t: want empty string, got %q", got)
-	}
-}
-
-func TestFormatTS_TT(t *testing.T) {
-	ts := time.Unix(1718450000, 123456000)
-	got := display.FormatTS(ts, time.Time{}, display.TSUnix)
-	if !strings.Contains(got, "1718450000") {
-		t.Errorf("-tt: want unix timestamp, got %q", got)
-	}
-}
-
-func TestFormatTS_TTT_FirstPacket(t *testing.T) {
-	ts := time.Unix(1000, 0)
-	got := display.FormatTS(ts, time.Time{}, display.TSDelta)
-	if !strings.Contains(got, "0.000000") {
-		t.Errorf("-ttt first packet: want 0.000000, got %q", got)
-	}
-}
-
-func TestFormatTS_TTT_Delta(t *testing.T) {
-	prev := time.Unix(1000, 0)
-	curr := time.Unix(1000, 500000000)
-	got := display.FormatTS(curr, prev, display.TSDelta)
-	if !strings.Contains(got, "0.500000") {
-		t.Errorf("-ttt delta: want 0.500000, got %q", got)
-	}
-}
-
-func TestFormatTS_TTTT(t *testing.T) {
-	ts := time.Date(2024, 6, 15, 12, 30, 45, 123456000, time.UTC)
-	got := display.FormatTS(ts, time.Time{}, display.TSDateTime)
-	if !strings.Contains(got, "2024-06-15") {
-		t.Errorf("-tttt: want date, got %q", got)
-	}
-}
-
-// printNormal / printVerbose / printPacket — integration with display
-
-func TestPrintNormal_TCP(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	pkt := decodePacket(buildTCPPacket("192.168.1.1", "8.8.8.8", 12345, 80, true, false))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	display.PrintNormal(1, pkt, display.Colorize(ts.Format("15:04:05.000000"), display.ColorGray), true)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "12345") {
-		t.Errorf("source port missing, output: %q", out)
-	}
-	if !strings.Contains(out, "80") {
-		t.Errorf("brak portu docelowego, output: %q", out)
-	}
-	if !strings.Contains(out, "192.168.1.1") {
-		t.Errorf("source IP missing, output: %q", out)
-	}
-}
-
-func TestPrintNormal_UDP(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	pkt := decodePacket(buildUDPPacket("10.0.0.1", "1.1.1.1", 54321, 53))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	display.PrintNormal(2, pkt, display.Colorize(ts.Format("15:04:05.000000"), display.ColorGray), true)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "54321") {
-		t.Errorf("source port missing, output: %q", out)
-	}
-}
-
-func TestPrintNormal_ARP(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	raw := buildARPPacket("192.168.1.1", "192.168.1.2", "aa:bb:cc:dd:ee:ff")
-	pkt := decodePacket(raw)
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	display.PrintNormal(1, pkt, display.Colorize(ts.Format("15:04:05.000000"), display.ColorGray), true)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "ARP") {
-		t.Errorf("ARP missing from output: %q", out)
-	}
-	if !strings.Contains(out, "Request") {
-		t.Errorf("'Request' missing from ARP output: %q", out)
-	}
-	if !strings.Contains(out, "length 28") {
-		t.Errorf("ARP length should be 28: %q", out)
-	}
-}
-
-func TestPrintVerbose_TCP(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	pkt := decodePacket(buildTCPPacket("10.0.0.1", "10.0.0.2", 1234, 443, true, false))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	display.PrintVerbose(1, pkt, display.Colorize(ts.Format("15:04:05.000000"), display.ColorGray), true)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "tos") {
-		t.Errorf("verbose TCP brak 'tos': %q", out)
-	}
-	if !strings.Contains(out, "Flags") {
-		t.Errorf("verbose TCP brak 'Flags': %q", out)
-	}
-	if !strings.Contains(out, "seq") {
-		t.Errorf("verbose TCP brak 'seq': %q", out)
-	}
-}
-
-func TestPrintVerbose_UDP(t *testing.T) {
-	buf, restore := display.CaptureOut()
-	defer restore()
-
-	pkt := decodePacket(buildUDPPacket("10.0.0.1", "10.0.0.2", 12345, 53))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	display.PrintVerbose(1, pkt, display.Colorize(ts.Format("15:04:05.000000"), display.ColorGray), true)
-	display.FlushOut()
-
-	out := buf.String()
-	if !strings.Contains(out, "proto UDP") {
-		t.Errorf("verbose UDP brak 'proto UDP': %q", out)
-	}
-}
-
-func TestPrintPacket_TimestampModes(t *testing.T) {
-	pkt := decodePacket(buildTCPPacket("1.2.3.4", "5.6.7.8", 1000, 80, false, true))
-	ts := time.Date(2024, 6, 15, 12, 0, 0, 123456000, time.UTC)
-	prev := time.Time{}
-
-	tests := []struct {
-		name        string
-		tsMode      display.TSMode
-		shouldEmpty bool
-		mustContain string
-	}{
-		{"default", display.TSDefault, false, "12:00:00"},
-		{"none", display.TSNone, true, ""},
-		{"unix", display.TSUnix, false, "."},
-		{"delta", display.TSDelta, false, "0.000000"},
-		{"datetime", display.TSDateTime, false, "2024-"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf, restore := display.CaptureOut()
-			defer restore()
-			display.PrintPacket(1, pkt, ts, prev, display.ViewNormal, tt.tsMode, false, true)
-			display.FlushOut()
-			got := buf.String()
-			if !tt.shouldEmpty && !strings.Contains(got, tt.mustContain) {
-				t.Errorf("tsMode=%v: want %q in %q", tt.tsMode, tt.mustContain, got)
-			}
-		})
-	}
-}
-
-func TestPrintPacket_ViewModes(t *testing.T) {
-	pkt := decodePacket(buildTCPPacket("1.2.3.4", "5.6.7.8", 1000, 80, true, false))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-	prev := time.Time{}
-
-	tests := []struct {
-		name        string
-		viewMode    display.ViewMode
-		mustContain string
-	}{
-		{"normal", display.ViewNormal, "1.2.3.4"},
-		{"verbose", display.ViewVerbose, "tos"},
-		{"hex", display.ViewHex, "0000"},
-		{"hexascii", display.ViewHexASCII, "|"},
-		{"hex_link", display.ViewHexLink, "0000"},
-		{"hexascii_link", display.ViewHexASCIILink, "|"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf, restore := display.CaptureOut()
-			defer restore()
-			display.PrintPacket(1, pkt, ts, prev, tt.viewMode, display.TSDefault, false, true)
-			display.FlushOut()
-			got := buf.String()
-			if !strings.Contains(got, tt.mustContain) {
-				t.Errorf("viewMode=%v: want %q in %q", tt.viewMode, tt.mustContain, got)
-			}
-		})
-	}
-}
-
-func TestPrintPacket_VerboseWithHex(t *testing.T) {
-	pkt := decodePacket(buildTCPPacket("1.2.3.4", "5.6.7.8", 1000, 80, true, false))
-	ts := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
-
-	buf, restore := display.CaptureOut()
-	defer restore()
-	display.PrintPacket(1, pkt, ts, time.Time{}, display.ViewHexASCIILink, display.TSDefault, true, true)
-	display.FlushOut()
-
-	got := buf.String()
-	if !strings.Contains(got, "tos") {
-		t.Errorf("-v -XX: brak verbose header (tos): %q", got)
-	}
-	if !strings.Contains(got, "|") {
-		t.Errorf("-v -XX: brak hex+ASCII dump: %q", got)
-	}
-}
-
-// pcapWriter (rotation)
-
-func TestPcapWriter_CreateAndWrite(t *testing.T) {
-	path := t.TempDir() + "/out.pcap"
-	pw := rotation.NewPcapWriter(path, 65535, layers.LinkTypeEthernet, 0, 0)
-	pw.Open()
-
-	raw := buildTCPPacket("1.2.3.4", "5.6.7.8", 1234, 80, true, false)
-	pw.WritePacket(time.Now(), raw)
-	pw.Close()
-
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("output file missing: %v", err)
-	}
-	minSize := int64(24 + 16 + len(raw))
-	if fi.Size() < minSize {
-		t.Errorf("file size = %d, want >= %d", fi.Size(), minSize)
-	}
-}
-
-func TestPcapWriter_Rotation(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/capture.pcap"
-	raw := buildTCPPacket("1.2.3.4", "5.6.7.8", 1234, 80, true, false)
-
-	pw := rotation.NewPcapWriter(path, 65535, layers.LinkTypeEthernet, 1, 0)
-	pw.Open()
-	pw.WritePacket(time.Now(), raw)
-	pw.WritePacket(time.Now(), raw)
-	pw.Close()
-
-	entries, err := os.ReadDir(dir)
+// TestGluedArgumentsReachTheParser proves the expansion is wired into parsing,
+// not just correct in isolation.
+func TestGluedArgumentsReachTheParser(t *testing.T) {
+	options, err := parseOptions([]string{"-nnc3", "-r" + testFixturePath}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) < 2 {
-		t.Errorf("expected >= 2 files after rotation, got %d", len(entries))
+	if !options.disableDNSAll {
+		t.Error("-nn was not applied")
+	}
+	if options.count != 3 {
+		t.Errorf("count = %d, want 3", options.count)
+	}
+	if options.readPcap != testFixturePath {
+		t.Errorf("readPcap = %q, want %q", options.readPcap, testFixturePath)
+	}
+}
+
+func TestImmediateModeDefaultsOnAndCanBeDisabled(t *testing.T) {
+	options, err := parseOptions([]string{"-i", "lo0"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.noImmediateMode {
+		t.Error("immediate mode is off by default; it must stay on")
+	}
+	options, err = parseOptions([]string{"-i", "lo0", "--immediate-mode=false"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !options.noImmediateMode {
+		t.Error("--immediate-mode=false did not disable immediate mode")
+	}
+}
+
+// -Z gives away exactly the privileges the offload restore needs, so the two
+// must not be accepted together.
+func TestDropPrivilegesRejectsDisableOffload(t *testing.T) {
+	options, err := parseOptions([]string{"-i", "lo0", "-Z", "nobody", "--disable-offload"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = finalizeOptions(&options)
+	if err == nil {
+		t.Fatal("finalizeOptions accepted -Z together with --disable-offload")
+	}
+	if !strings.Contains(err.Error(), "disable-offload") {
+		t.Fatalf("error = %v, want it to name the conflicting option", err)
+	}
+}
+
+func TestDropUserIsAppliedWhenReadingAFile(t *testing.T) {
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	err := run([]string{"-r", testFixturePath, "-n", "-t", "-Z", "no-such-account-cf19a4"}, stdout, stderr)
+	if err == nil {
+		t.Fatal("run ignored -Z with an unknown user")
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("packets were printed before the privilege drop failed: %q", stdout.String())
+	}
+}
+
+func TestParseOptionsUsesPositionalAndFilterFileBPF(t *testing.T) {
+	options, err := parseOptions([]string{"-r", testFixturePath, "tcp", "port", "80"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.filter != "tcp port 80" {
+		t.Fatalf("positional filter = %q", options.filter)
+	}
+
+	filterPath := filepath.Join(t.TempDir(), "capture.bpf")
+	if err := os.WriteFile(filterPath, []byte("# comment\ntcp\nport 443\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	options, err = parseOptions([]string{"-r", testFixturePath, "-F", filterPath}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.filter != "tcp port 443" {
+		t.Fatalf("file filter = %q", options.filter)
+	}
+	if _, err := parseOptions([]string{"-F", filterPath, "udp"}, io.Discard); err == nil {
+		t.Fatal("-F plus positional filter unexpectedly succeeded")
+	}
+}
+
+func TestRunOfflinePresentationAndFilter(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := run([]string{"-r", testFixturePath, "-n", "-t", "tcp"}, stdout, stderr); err != nil {
+		t.Fatal(err)
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "192.168.1.1.12345") || strings.Contains(output, "10.0.0.1.54321") {
+		t.Fatalf("filtered output = %q", output)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run([]string{"-r", testFixturePath, "-n", "-t", "-q"}, stdout, stderr); err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(strings.TrimSpace(stdout.String()), "\n") + 1; lines != 2 {
+		t.Fatalf("-q printed %d lines: %q", lines, stdout.String())
+	}
+	// tcpdump's quick mode abbreviates TCP but keeps UDP's full wording.
+	if !strings.Contains(stdout.String(), "tcp 5") || !strings.Contains(stdout.String(), "UDP, length") {
+		t.Fatalf("-q is incorrectly silent: %q", stdout.String())
+	}
+}
+
+func TestRawOutputDefaultsToNoPacketTextAndPreservesMetadata(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "copy.pcap")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := run([]string{"-r", testFixturePath, "-w", outputPath, "-n", "-t"}, stdout, stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("-w unexpectedly printed packets: %q", stdout.String())
+	}
+
+	file, err := os.Open(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	reader, err := pcapgo.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ci, err := reader.ReadPacketData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTS := time.Date(2024, 1, 1, 12, 0, 0, 123456789, time.UTC)
+	if ci.Length != 1500 || !ci.Timestamp.Equal(wantTS) || reader.Snaplen() != 65535 {
+		t.Fatalf("rewritten metadata = %+v, snaplen=%d", ci, reader.Snaplen())
+	}
+}
+
+func TestRawOutputPrintExtension(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "copy.pcap")
+	stdout := &bytes.Buffer{}
+	if err := run([]string{"-r", testFixturePath, "-w", outputPath, "--print", "-n", "-t"}, stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "192.168.1.1") {
+		t.Fatalf("--print output = %q", stdout.String())
+	}
+}
+
+func TestRunRejectsEveryInputOutputCollision(t *testing.T) {
+	t.Run("same path", func(t *testing.T) {
+		if err := run([]string{"-r", testFixturePath, "-w", testFixturePath}, io.Discard, io.Discard); err == nil {
+			t.Fatal("same input/output unexpectedly succeeded")
+		}
+	})
+
+	t.Run("hard link", func(t *testing.T) {
+		hardlink := filepath.Join(t.TempDir(), "alias.pcap")
+		if err := os.Link(testFixturePath, hardlink); err != nil {
+			t.Skipf("hard links unavailable: %v", err)
+		}
+		if err := run([]string{"-r", testFixturePath, "-w", hardlink}, io.Discard, io.Discard); err == nil {
+			t.Fatal("hard-linked output unexpectedly succeeded")
+		}
+	})
+
+	t.Run("CSV", func(t *testing.T) {
+		if err := run([]string{"-r", testFixturePath, "--stats-only", "--csv", testFixturePath}, io.Discard, io.Discard); err == nil {
+			t.Fatal("CSV/input collision unexpectedly succeeded")
+		}
+	})
+
+	t.Run("future rotation segment", func(t *testing.T) {
+		directory := t.TempDir()
+		input := filepath.Join(directory, "capture_001.pcap")
+		data, err := os.ReadFile(testFixturePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(input, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := run([]string{"-r", input, "-w", filepath.Join(directory, "capture.pcap"), "-C", "1"}, io.Discard, io.Discard); err == nil {
+			t.Fatal("rotation namespace collision unexpectedly succeeded")
+		}
+	})
+	t.Run("case-insensitive rotation namespace", func(t *testing.T) {
+		directory := t.TempDir()
+		input := filepath.Join(directory, "capture_001.PCAP")
+		output := filepath.Join(directory, "capture.pcap")
+		if err := pathguard.ValidateOutputPaths(input, output, "", true); err == nil {
+			t.Fatal("case-only rotation collision unexpectedly succeeded")
+		}
+	})
+}
+
+func TestCorruptPcapReturnsFailureAfterReadablePackets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.pcap")
+	data, err := os.ReadFile(testFixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data[:len(data)-3], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout := &bytes.Buffer{}
+	err = run([]string{"-r", path, "-n", "-t"}, stdout, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "record 2") {
+		t.Fatalf("corrupt input error = %v", err)
+	}
+	if !strings.Contains(stdout.String(), "192.168.1.1") {
+		t.Fatalf("first complete packet was not printed: %q", stdout.String())
+	}
+}
+
+func TestWriterIsClosedWhenCSVFails(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "out.pcap")
+	missingCSV := filepath.Join(t.TempDir(), "missing", "flows.csv")
+	err := run([]string{"-r", testFixturePath, "-w", outputPath, "--csv", missingCSV}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("invalid CSV destination unexpectedly succeeded")
+	}
+	file, openErr := os.Open(outputPath)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer func() { _ = file.Close() }()
+	reader, readErr := pcapgo.NewReader(file)
+	if readErr != nil {
+		t.Fatalf("raw output was not flushed before error: %v", readErr)
+	}
+	count := 0
+	for {
+		_, _, readErr = reader.ReadPacketData()
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("raw output packets = %d, want 2", count)
+	}
+}
+
+func TestMixedLinkPcapngIsPreservedOrExplicitlyRejected(t *testing.T) {
+	directory := t.TempDir()
+	input := filepath.Join(directory, "mixed.pcapng")
+	createMixedPcapng(input)
+
+	t.Run("pcapng", func(t *testing.T) {
+		output := filepath.Join(directory, "copy.pcapng")
+		if err := run([]string{"-r", input, "-w", output, "-n"}, io.Discard, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		reader, err := offline.Open(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		var linkTypes []layers.LinkType
+		for {
+			_, _, linkType, err := reader.ReadPacketData()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			linkTypes = append(linkTypes, linkType)
+		}
+		if len(linkTypes) != 2 || linkTypes[0] != layers.LinkTypeEthernet || linkTypes[1] != layers.LinkTypeRaw {
+			t.Fatalf("output link types = %v", linkTypes)
+		}
+	})
+
+	t.Run("classic", func(t *testing.T) {
+		output := filepath.Join(directory, "copy.pcap")
+		err := run([]string{"-r", input, "-w", output, "-n"}, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "cannot contain both") {
+			t.Fatalf("classic mixed-link error = %v", err)
+		}
+	})
+}
+
+func TestWriteCSVIsDeterministicAndParseable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flows.csv")
+	flows := map[flowKey]uint64{
+		{Src: "3.3.3.3", Dst: "4.4.4.4", Sport: "2", Dport: "53", Proto: "UDP"}: 2,
+		{Src: "1.1.1.1", Dst: "2.2.2.2", Sport: "1", Dport: "80", Proto: "TCP"}: 5,
+	}
+	if err := writeCSV(path, flows); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+	records, err := csv.NewReader(file).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 || records[1][0] != "1.1.1.1" || records[2][0] != "3.3.3.3" {
+		t.Fatalf("CSV records = %v", records)
+	}
+}
+
+func TestCountAndStatsOnly(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := run([]string{"-r", testFixturePath, "--count", "tcp"}, stdout, stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "1 packets\n" {
+		t.Fatalf("count output = %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run([]string{"-r", testFixturePath, "--stats-only", "-n"}, stdout, stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "Session summary") || strings.Contains(stdout.String(), "192.168.1.1.12345") {
+		t.Fatalf("stats-only output = %q", stdout.String())
+	}
+}
+
+func TestOptionsWithoutCaptureSourceOrRequiredOutputFail(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "unused.pcap")
+	tests := [][]string{
+		{"-w", output},
+		{"-r", testFixturePath, "--pcapng"},
+		{"-r", testFixturePath, "--print"},
+	}
+	for _, args := range tests {
+		if err := run(args, io.Discard, io.Discard); err == nil {
+			t.Errorf("run(%q) unexpectedly succeeded", args)
+		}
+	}
+	if _, err := os.Stat(output); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source-less -w created output: %v", err)
+	}
+}
+
+func TestCountDoesNotCorruptRawStdout(t *testing.T) {
+	if compareBinaryPath == "" {
+		t.Skip("comparison binary unavailable")
+	}
+	command := exec.Command(compareBinaryPath, "-r", testFixturePath, "-w", "-", "--count")
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	raw, err := command.Output()
+	if err != nil {
+		t.Fatalf("raw stdout command failed: %v: %s", err, stderr.String())
+	}
+	reader, err := pcapgo.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("raw stdout is not pcap: %v", err)
+	}
+	for packet := 1; packet <= 2; packet++ {
+		if _, _, err := reader.ReadPacketData(); err != nil {
+			t.Fatalf("read raw stdout packet %d: %v", packet, err)
+		}
+	}
+	if _, _, err := reader.ReadPacketData(); !errors.Is(err, io.EOF) {
+		t.Fatalf("raw stdout has trailing non-pcap data: %v", err)
+	}
+	if stderr.String() != "2 packets\n" {
+		t.Fatalf("count status = %q", stderr.String())
+	}
+}
+
+func TestEmptyPcapngRewriteCreatesValidOutputAndValidatesBPF(t *testing.T) {
+	directory := t.TempDir()
+	input := filepath.Join(directory, "empty.pcapng")
+	file, err := os.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intf := pcapgo.DefaultNgInterface
+	intf.LinkType = layers.LinkTypeEthernet
+	intf.SnapLength = 9000
+	writer, err := pcapgo.NewNgWriterInterface(file, intf, pcapgo.DefaultNgWriterOptions)
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	output := filepath.Join(directory, "copy.pcapng")
+	if err := run([]string{"-r", input, "-w", output}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := offline.Open(output)
+	if err != nil {
+		t.Fatalf("open empty rewrite: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	if _, _, _, err := reader.ReadPacketData(); !errors.Is(err, io.EOF) {
+		t.Fatalf("empty rewrite read = %v, want EOF", err)
+	}
+	copiedInterface, err := reader.Interface(0)
+	if err != nil {
+		t.Fatalf("read copied interface: %v", err)
+	}
+	if copiedInterface.LinkType != layers.LinkTypeEthernet || copiedInterface.SnapLength != 9000 {
+		t.Fatalf("copied interface = %+v", copiedInterface)
+	}
+
+	if err := run([]string{"-r", input, "tcp and and"}, io.Discard, io.Discard); err == nil {
+		t.Fatal("invalid BPF on an empty pcapng unexpectedly succeeded")
+	}
+}
+
+func createTestPcap(path string) {
+	file, err := os.Create(path)
+	if err != nil {
+		panic(err)
+	}
+	writer := pcapgo.NewWriterNanos(file)
+	if err := writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
+		panic(err)
+	}
+	timestamp := time.Date(2024, 1, 1, 12, 0, 0, 123456789, time.UTC)
+	packets := []struct {
+		data       []byte
+		wireLength int
+	}{
+		{data: buildTCPPacket("192.168.1.1", "8.8.8.8", 12345, 80, true, false), wireLength: 1500},
+		{data: buildUDPPacket("10.0.0.1", "1.1.1.1", 54321, 53), wireLength: 43},
+	}
+	for _, packet := range packets {
+		ci := gopacket.CaptureInfo{Timestamp: timestamp, CaptureLength: len(packet.data), Length: max(packet.wireLength, len(packet.data))}
+		if err := writer.WritePacket(ci, packet.data); err != nil {
+			panic(err)
+		}
+		timestamp = timestamp.Add(time.Millisecond)
+	}
+	if err := file.Close(); err != nil {
+		panic(err)
+	}
+}
+
+func buildTCPPacket(srcIP, dstIP string, srcPort, dstPort uint16, syn, ack bool) []byte {
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	ip := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolTCP, SrcIP: net.ParseIP(srcIP).To4(), DstIP: net.ParseIP(dstIP).To4()}
+	tcp := &layers.TCP{SrcPort: layers.TCPPort(srcPort), DstPort: layers.TCPPort(dstPort), SYN: syn, ACK: ack, Window: 65535}
+	_ = tcp.SetNetworkLayerForChecksum(ip)
+	ethernet := &layers.Ethernet{SrcMAC: net.HardwareAddr{0, 1, 2, 3, 4, 5}, DstMAC: net.HardwareAddr{6, 7, 8, 9, 10, 11}, EthernetType: layers.EthernetTypeIPv4}
+	if err := gopacket.SerializeLayers(buffer, options, ethernet, ip, tcp, gopacket.Payload([]byte("hello"))); err != nil {
+		panic(err)
+	}
+	return buffer.Bytes()
+}
+
+func buildUDPPacket(srcIP, dstIP string, srcPort, dstPort uint16) []byte {
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	ip := &layers.IPv4{Version: 4, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: net.ParseIP(srcIP).To4(), DstIP: net.ParseIP(dstIP).To4()}
+	udp := &layers.UDP{SrcPort: layers.UDPPort(srcPort), DstPort: layers.UDPPort(dstPort)}
+	_ = udp.SetNetworkLayerForChecksum(ip)
+	ethernet := &layers.Ethernet{SrcMAC: net.HardwareAddr{0, 1, 2, 3, 4, 5}, DstMAC: net.HardwareAddr{6, 7, 8, 9, 10, 11}, EthernetType: layers.EthernetTypeIPv4}
+	if err := gopacket.SerializeLayers(buffer, options, ethernet, ip, udp, gopacket.Payload([]byte{0})); err != nil {
+		panic(err)
+	}
+	return buffer.Bytes()
+}
+
+func createMixedPcapng(path string) {
+	file, err := os.Create(path)
+	if err != nil {
+		panic(err)
+	}
+	first := pcapgo.DefaultNgInterface
+	first.LinkType = layers.LinkTypeEthernet
+	first.SnapLength = 65535
+	writer, err := pcapgo.NewNgWriterInterface(file, first, pcapgo.DefaultNgWriterOptions)
+	if err != nil {
+		panic(err)
+	}
+	second := pcapgo.DefaultNgInterface
+	second.LinkType = layers.LinkTypeRaw
+	second.SnapLength = 65535
+	secondID, err := writer.AddInterface(second)
+	if err != nil {
+		panic(err)
+	}
+	ethernetPacket := buildTCPPacket("192.0.2.1", "198.51.100.2", 1000, 80, true, false)
+	rawPacket := buildUDPPacket("192.0.2.3", "198.51.100.4", 2000, 53)[14:]
+	for _, packet := range []struct {
+		data           []byte
+		interfaceIndex int
+	}{
+		{data: ethernetPacket, interfaceIndex: 0},
+		{data: rawPacket, interfaceIndex: secondID},
+	} {
+		ci := gopacket.CaptureInfo{Timestamp: time.Unix(int64(packet.interfaceIndex+1), 1), CaptureLength: len(packet.data), Length: len(packet.data), InterfaceIndex: packet.interfaceIndex}
+		if err := writer.WritePacket(ci, packet.data); err != nil {
+			panic(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		panic(err)
+	}
+	if err := file.Close(); err != nil {
+		panic(err)
+	}
+}
+
+// -Z on an unprivileged process is a warning, not a failure: tcpdump ignores
+// it because there is nothing to drop, and packets must still be printed.
+func TestDropUserWithoutRootWarnsAndContinues(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: the drop would succeed")
+	}
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	if err := run([]string{"-r", testFixturePath, "-n", "-t", "-Z", "nobody"}, stdout, stderr); err != nil {
+		t.Fatalf("run failed instead of warning: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "-Z ignored") {
+		t.Fatalf("no warning about the skipped privilege drop: %q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "192.168.1.1") {
+		t.Fatalf("packets were not printed: %q", stdout.String())
 	}
 }

@@ -2,14 +2,14 @@ package main
 
 // Comparison tests: tcpdump_go vs system tcpdump.
 //
-// For each *.pcap file in the project directory we run both tools
+// For each committed/generated test fixture we run both tools
 // with -n (no reverse-DNS) and -t (no timestamp), then compare
 // the extracted flows (src.port > dst.port).
 //
 // Tests are skipped when:
 //   - system tcpdump is not available (exec.LookPath)
 //   - building the tcpdump_go binary failed (see TestMain in main_test.go)
-//   - no *.pcap files exist in the project directory
+//   - no test fixture is available
 
 import (
 	"bufio"
@@ -100,7 +100,7 @@ func runTcpdumpGo(t *testing.T, pcapFile string) []parsedFlow {
 	}
 	flows := parseFlowsFrom(stdout)
 	if err := cmd.Wait(); err != nil {
-		t.Logf("tcpdump_go exited with error: %v (may be OK for small pcaps)", err)
+		t.Fatalf("tcpdump_go exited with error: %v", err)
 	}
 	return flows
 }
@@ -121,7 +121,9 @@ func runSystemTcpdump(t *testing.T, tcpdumpBin, pcapFile string) []parsedFlow {
 		t.Fatalf("tcpdump: Start: %v", err)
 	}
 	flows := parseFlowsFrom(stdout)
-	_ = cmd.Wait() // tcpdump may return != 0 on macOS in read-only mode
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("tcpdump exited with error: %v", err)
+	}
 	return flows
 }
 
@@ -139,11 +141,14 @@ func findSystemTcpdump() string {
 	return ""
 }
 
-// pcapFilesInRoot returns *.pcap files in the project root directory.
-// Excludes testdata/ — those are synthetic files created by TestMain.
+// pcapFilesInRoot returns the deterministic fixture created by TestMain. The
+// historical root glob made every comparison silently skip on clean clones
+// because *.pcap is ignored by git.
 func pcapFilesInRoot() []string {
-	matches, _ := filepath.Glob("*.pcap")
-	return matches
+	if testFixturePath == "" {
+		return nil
+	}
+	return []string{testFixturePath}
 }
 
 // Comparison tests
@@ -238,7 +243,7 @@ func TestCompare_WithBPFFilter(t *testing.T) {
 		pcap := pcap
 
 		// tcpdump_go with TCP filter — the entire pcap fits in the response.
-		cmdGo := exec.Command(compareBinaryPath, "-r", pcap, "-n", "-t", "-f", "tcp") //#nosec G204
+		cmdGo := exec.Command(compareBinaryPath, "-r", pcap, "-n", "-t", "tcp") //#nosec G204
 		cmdGo.Stderr = io.Discard
 		outGo, errGo := cmdGo.Output()
 
@@ -285,7 +290,7 @@ func comparePrecheck(t *testing.T) (tcpdumpBin string, pcapFiles []string) {
 	}
 	pcapFiles = pcapFilesInRoot()
 	if len(pcapFiles) == 0 {
-		t.Skip("no *.pcap files in project directory")
+		t.Skip("no pcap fixture available")
 	}
 	return tcpdumpBin, pcapFiles
 }
