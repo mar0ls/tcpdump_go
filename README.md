@@ -1,5 +1,9 @@
 # tcpdump_go
 
+[![CI](https://github.com/mar0ls/tcpdump_go/actions/workflows/test.yml/badge.svg)](https://github.com/mar0ls/tcpdump_go/actions/workflows/test.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/mar0ls/tcpdump_go)](go.mod)
+[![Release](https://img.shields.io/github/v/release/mar0ls/tcpdump_go)](https://github.com/mar0ls/tcpdump_go/releases/latest)
+
 Network packet analyzer written in Go on top of libpcap and
 [gopacket](https://github.com/gopacket/gopacket).
 
