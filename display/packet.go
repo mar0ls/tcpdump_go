@@ -3,7 +3,6 @@ package display
 import (
 	"encoding/binary"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
@@ -153,7 +152,7 @@ func PrintNormal(num uint64, packet gopacket.Packet, tsStr string, disableDNS bo
 
 func printPacketLine(num uint64, packet gopacket.Packet, tsStr string, disableDNS, quick bool) error {
 	prefix := packetPrefix(num, tsStr, packet, quick)
-	nl, done, err := printWithoutIP(prefix, packet, disableDNS)
+	nl, done, err := printWithoutIP(prefix, packet, disableDNS, 0)
 	if done {
 		return err
 	}
@@ -171,7 +170,7 @@ func printPacketLine(num uint64, packet gopacket.Packet, tsStr string, disableDN
 // PrintVerbose prints IP metadata followed by the protocol summary.
 func PrintVerbose(num uint64, packet gopacket.Packet, tsStr string, verbosity int, disableDNS bool) error {
 	prefix := packetPrefix(num, tsStr, packet, false)
-	nl, done, err := printWithoutIP(prefix, packet, disableDNS)
+	nl, done, err := printWithoutIP(prefix, packet, disableDNS, verbosity)
 	if done {
 		return err
 	}
@@ -204,7 +203,7 @@ func ipTag(nl gopacket.NetworkLayer) string {
 // printWithoutIP renders the cases both packet renderers share: a header
 // decode failure, ARP, and frames with no network layer. It returns the
 // network layer when there is one left to print.
-func printWithoutIP(prefix string, packet gopacket.Packet, disableDNS bool) (gopacket.NetworkLayer, bool, error) {
+func printWithoutIP(prefix string, packet gopacket.Packet, disableDNS bool, verbosity int) (gopacket.NetworkLayer, bool, error) {
 	if marker, endpoints, ok := decodeFailure(packet, disableDNS); ok {
 		if endpoints != "" {
 			return nil, true, Outf("%s%s: %s\n", prefix, endpoints, marker)
@@ -216,7 +215,7 @@ func printWithoutIP(prefix string, packet gopacket.Packet, disableDNS bool) (gop
 		if !ok {
 			return nil, true, Outf("%sARP [invalid]\n", prefix)
 		}
-		return nil, true, printARPLine(prefix, arp)
+		return nil, true, printARPLine(prefix, arp, verbosity)
 	}
 	nl := packet.NetworkLayer()
 	if nl == nil {
@@ -411,14 +410,18 @@ func transportSummary(packet gopacket.Packet, nl gopacket.NetworkLayer, src, dst
 			if udp.Length >= 8 {
 				length = int(udp.Length) - 8
 			}
-			if failure := applicationFailure(packet, udp.SrcPort == 53 || udp.DstPort == 53, len(udp.LayerPayload())); failure != "" {
+			// The NTP printer renders a short or malformed message the way
+			// tcpdump does, so the generic decoder-failure path must not
+			// pre-empt it.
+			isNTP := ntpPorts[uint16(udp.SrcPort)] || ntpPorts[uint16(udp.DstPort)]
+			if failure := applicationFailure(packet, udp.SrcPort == 53 || udp.DstPort == 53, len(udp.LayerPayload())); failure != "" && !isNTP {
 				if verbosity > 1 {
 					failure = udpChecksumNote(nl, udp) + failure
 				}
 				return fmt.Sprintf("%s.%s > %s.%s: %s", Colorize(src, ColorGreen), portName("udp", uint16(udp.SrcPort)), Colorize(dst, ColorRed), portName("udp", uint16(udp.DstPort)), failure)
 			}
 			body := fmt.Sprintf("UDP, length %d", max(0, length))
-			if app := applicationSummary(packet, uint16(udp.SrcPort), uint16(udp.DstPort), udp.LayerPayload(), verbosity); app != "" {
+			if app := applicationSummary(packet, uint16(udp.SrcPort), uint16(udp.DstPort), udp.LayerPayload(), max(0, length), verbosity, true); app != "" {
 				body = app
 			}
 			if verbosity > 1 {
@@ -495,7 +498,7 @@ func tcpSummary(packet gopacket.Packet, nl gopacket.NetworkLayer, src, dst strin
 		parts = append(parts, failure)
 	}
 	body := strings.Join(parts, ", ")
-	if app := applicationSummary(packet, uint16(tcp.SrcPort), uint16(tcp.DstPort), tcp.LayerPayload(), verbosity); app != "" {
+	if app := applicationSummary(packet, uint16(tcp.SrcPort), uint16(tcp.DstPort), tcp.LayerPayload(), len(tcp.LayerPayload()), verbosity, false); app != "" {
 		body += ": " + app
 	}
 	return fmt.Sprintf("%s.%s > %s.%s: %s", Colorize(src, ColorGreen), portName("tcp", uint16(tcp.SrcPort)), Colorize(dst, ColorRed), portName("tcp", uint16(tcp.DstPort)), body)
@@ -738,20 +741,6 @@ func icmp6Summary(packet gopacket.Packet, icmp *layers.ICMPv6, length int) strin
 		}
 	}
 	return fmt.Sprintf("%s, length %d", typeName, length)
-}
-
-func printARPLine(prefix string, arp *layers.ARP) error {
-	var operation string
-	switch arp.Operation {
-	case layers.ARPRequest:
-		operation = fmt.Sprintf("Request who-has %s tell %s", net.IP(arp.DstProtAddress), net.IP(arp.SourceProtAddress))
-	case layers.ARPReply:
-		operation = fmt.Sprintf("Reply %s is-at %s", net.IP(arp.SourceProtAddress), net.HardwareAddr(arp.SourceHwAddress))
-	default:
-		operation = fmt.Sprintf("op %d", arp.Operation)
-	}
-	arpLength := int(8 + 2*uint16(arp.HwAddressSize) + 2*uint16(arp.ProtAddressSize))
-	return Outf("%s%s, %s, length %d\n", prefix, Colorize("ARP", ColorYellow), operation, arpLength)
 }
 
 // TCPFlagsShort returns tcpdump's TCP flag notation.

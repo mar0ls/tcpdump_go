@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcap"
 )
 
@@ -132,29 +133,11 @@ func RunCapture(cfg Config) (retErr error) {
 		outputName = cfg.OutPcap
 	)
 	if cfg.OutPcap != "" {
-		if cfg.PcapNG {
-			if cfg.RotateSize > 0 || cfg.RotateTime > 0 {
-				return errors.New("pcapng rotation is not supported")
-			}
-			writer := offline.NewNgWriter(cfg.OutPcap)
-			if err := writer.Open(handle.LinkType(), cfg.Snaplen); err != nil {
-				return err
-			}
-			writeRaw = func(ci gopacket.CaptureInfo, data []byte) error {
-				return writer.WritePacket(ci, data, handle.LinkType(), cfg.Snaplen)
-			}
-			flushRaw = writer.Flush
-			closeRaw = writer.Close
-		} else {
-			writer := rotation.NewPcapWriter(cfg.OutPcap, cfg.Snaplen, handle.LinkType(), cfg.RotateSize, cfg.RotateTime)
-			if err := writer.Open(); err != nil {
-				return err
-			}
-			writeRaw = writer.WritePacket
-			flushRaw = writer.Flush
-			closeRaw = writer.Close
-			outputName = writer.Filename()
+		out, err := openRawOutput(cfg, handle.LinkType())
+		if err != nil {
+			return err
 		}
+		writeRaw, flushRaw, closeRaw, outputName = out.write, out.flush, out.close, out.name
 		defer func() {
 			retErr = errors.Join(retErr, closeRaw())
 		}()
@@ -190,40 +173,45 @@ func RunCapture(cfg Config) (retErr error) {
 	signalCtx, stopSignals := signal.NotifyContext(context.Background(), ShutdownSignals...)
 	defer stopSignals()
 
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packetSource.Lazy = true
-	packetSource.NoCopy = true
-
 	st := stats.NewStats()
-	var prevTS time.Time
-	process := func(cp capturedPacket) error {
-		packet := cp.packet
-		ci := packet.Metadata().CaptureInfo
-		st.Update(packet)
-		if !cfg.Quiet {
-			if err := display.PrintPacket(cp.num, packet, ci.Timestamp, prevTS, cfg.ViewMode, cfg.TSMode, cfg.Verbosity, cfg.DisableDNS); err != nil {
-				return fmt.Errorf("print packet %d: %w", cp.num, err)
-			}
-		}
-		prevTS = ci.Timestamp
-		if cfg.OutPcap != "" {
-			if err := writeRaw(ci, packet.Data()); err != nil {
-				return err
-			}
-			if cfg.FlushPcapEveryPacket {
-				if err := flushRaw(); err != nil {
-					return err
+	var runErr error
+	if rawWriteOnly(cfg) {
+		runErr = runRawWritePipeline(signalCtx, handle, cfg.Count, writeRaw, flushRaw, cfg.FlushPcapEveryPacket, &st.Total)
+	} else {
+		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+		packetSource.Lazy = true
+		packetSource.NoCopy = true
+
+		var prevTS time.Time
+		process := func(cp capturedPacket) error {
+			packet := cp.packet
+			ci := packet.Metadata().CaptureInfo
+			st.Update(packet)
+			if !cfg.Quiet {
+				if err := display.PrintPacket(cp.num, packet, ci.Timestamp, prevTS, cfg.ViewMode, cfg.TSMode, cfg.Verbosity, cfg.DisableDNS); err != nil {
+					return fmt.Errorf("print packet %d: %w", cp.num, err)
 				}
 			}
+			prevTS = ci.Timestamp
+			if cfg.OutPcap != "" {
+				if err := writeRaw(ci, packet.Data()); err != nil {
+					return err
+				}
+				if cfg.FlushPcapEveryPacket {
+					if err := flushRaw(); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
 		}
-		return nil
-	}
 
-	var flush func() error
-	if !cfg.Quiet {
-		flush = display.FlushOut
+		var flush func() error
+		if !cfg.Quiet {
+			flush = display.FlushOut
+		}
+		runErr = runPacketPipeline(signalCtx, packetSource, cfg.Count, captureQueueDepth(cfg.BufSize), defaultQueueBytes, process, flush, cfg.FlushEveryPacket)
 	}
-	runErr := runPacketPipeline(signalCtx, packetSource, cfg.Count, captureQueueDepth(cfg.BufSize), defaultQueueBytes, process, flush, cfg.FlushEveryPacket)
 
 	// -W with -G ends the capture on purpose once the file count is reached.
 	if errors.Is(runErr, rotation.ErrFileLimitReached) {
@@ -248,6 +236,48 @@ func RunCapture(cfg Config) (retErr error) {
 		flushErr = fmt.Errorf("flush output: %w", flushErr)
 	}
 	return errors.Join(runErr, statsErr, summaryErr, statsPrintErr, flushErr)
+}
+
+// rawOutput is the set of writer callbacks -w installs.
+type rawOutput struct {
+	write func(gopacket.CaptureInfo, []byte) error
+	flush func() error
+	close func() error
+	name  string
+}
+
+// openRawOutput builds the -w writer for linkType. It is separate from
+// RunCapture so that every rotation setting it has to forward can be checked
+// without opening an interface; -W reaching the writer was missed here once.
+func openRawOutput(cfg Config, linkType layers.LinkType) (rawOutput, error) {
+	if cfg.PcapNG {
+		if cfg.RotateSize > 0 || cfg.RotateTime > 0 {
+			return rawOutput{}, errors.New("pcapng rotation is not supported")
+		}
+		writer := offline.NewNgWriter(cfg.OutPcap)
+		if err := writer.Open(linkType, cfg.Snaplen); err != nil {
+			return rawOutput{}, err
+		}
+		return rawOutput{
+			write: func(ci gopacket.CaptureInfo, data []byte) error {
+				return writer.WritePacket(ci, data, linkType, cfg.Snaplen)
+			},
+			flush: writer.Flush,
+			close: writer.Close,
+			name:  cfg.OutPcap,
+		}, nil
+	}
+	writer := rotation.NewPcapWriter(cfg.OutPcap, cfg.Snaplen, linkType, cfg.RotateSize, cfg.RotateTime)
+	writer.SetMaxFiles(cfg.MaxFiles)
+	if err := writer.Open(); err != nil {
+		return rawOutput{}, err
+	}
+	return rawOutput{
+		write: writer.WritePacket,
+		flush: writer.Flush,
+		close: writer.Close,
+		name:  writer.Filename(),
+	}, nil
 }
 
 // printCaptureSummary writes tcpdump's closing counters to the status stream,
@@ -413,6 +443,67 @@ func (f *flightControl) release(size int) {
 	case f.drained <- struct{}{}:
 	default: // the producer is not waiting; it re-checks the budget anyway
 	}
+}
+
+type rawPacketReader interface {
+	ZeroCopyReadPacketData() ([]byte, gopacket.CaptureInfo, error)
+}
+
+// rawWriteOnly reports whether the session writes packets to a file and
+// nothing else looks inside them. Statistics decode every network and
+// transport header, so they are only free to skip when -stats is off.
+func rawWriteOnly(cfg Config) bool {
+	return cfg.OutPcap != "" && cfg.Quiet && !cfg.ShowStats
+}
+
+// runRawWritePipeline is the -w path for a session that never decodes a
+// packet: libpcap's own buffer goes straight to the writer, so no
+// gopacket.Packet is built and nothing is copied per packet.
+//
+// Single-threaded on purpose. The zero-copy buffer is only valid until the
+// next read, so handing it to another goroutine would mean copying it back,
+// and a buffered file writer is not the slow side of this loop; measured on
+// 2M packets, the copy-and-queue variant costs about as much as the decoding
+// path it replaces.
+func runRawWritePipeline(
+	stopCtx context.Context,
+	source rawPacketReader,
+	count uint64,
+	write func(gopacket.CaptureInfo, []byte) error,
+	flush func() error,
+	flushEveryPacket bool,
+	captured *uint64,
+) error {
+	for count == 0 || *captured < count {
+		if stopCtx.Err() != nil {
+			return nil
+		}
+
+		data, ci, err := source.ZeroCopyReadPacketData()
+		if err != nil {
+			if stopCtx.Err() != nil {
+				return nil
+			}
+			if errors.Is(err, pcap.NextErrorTimeoutExpired) {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("live capture ended unexpectedly: %w", err)
+			}
+			return fmt.Errorf("read packet: %w", err)
+		}
+
+		*captured++
+		if err := write(ci, data); err != nil {
+			return err
+		}
+		if flushEveryPacket {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // runPacketPipeline decouples libpcap reads from potentially slower packet

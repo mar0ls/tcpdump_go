@@ -87,10 +87,12 @@ func flowCounts(flows []parsedFlow) map[string]int {
 }
 
 // runTcpdumpGo runs the built tcpdump_go binary on a pcap file.
-// Flags: -r <file> -n (no DNS) -t (no timestamp).
+// Flags: -r <file> -nn (numeric hosts and ports) -t (no timestamp). It has to
+// be -nn rather than -n: upstream tcpdump counts the flag and still resolves
+// port names when given only one, so the flow parser would find none.
 func runTcpdumpGo(t *testing.T, pcapFile string) []parsedFlow {
 	t.Helper()
-	cmd := exec.Command(compareBinaryPath, "-r", pcapFile, "-n", "-t") //#nosec G204
+	cmd := exec.Command(compareBinaryPath, "-r", pcapFile, "-nn", "-t") //#nosec G204
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("tcpdump_go: StdoutPipe: %v", err)
@@ -110,7 +112,7 @@ func runTcpdumpGo(t *testing.T, pcapFile string) []parsedFlow {
 // Diagnostic output (stderr) is discarded — tcpdump writes metadata there.
 func runSystemTcpdump(t *testing.T, tcpdumpBin, pcapFile string) []parsedFlow {
 	t.Helper()
-	cmd := exec.Command(tcpdumpBin, "-r", pcapFile, "-n", "-t") //#nosec G204
+	cmd := exec.Command(tcpdumpBin, "-r", pcapFile, "-nn", "-t") //#nosec G204
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("tcpdump: StdoutPipe: %v", err)
@@ -243,11 +245,11 @@ func TestCompare_WithBPFFilter(t *testing.T) {
 		pcap := pcap
 
 		// tcpdump_go with TCP filter — the entire pcap fits in the response.
-		cmdGo := exec.Command(compareBinaryPath, "-r", pcap, "-n", "-t", "tcp") //#nosec G204
+		cmdGo := exec.Command(compareBinaryPath, "-r", pcap, "-nn", "-t", "tcp") //#nosec G204
 		cmdGo.Stderr = io.Discard
 		outGo, errGo := cmdGo.Output()
 
-		cmdSys := exec.Command(tcpdumpBin, "-r", pcap, "-n", "-t", "tcp") //#nosec G204
+		cmdSys := exec.Command(tcpdumpBin, "-r", pcap, "-nn", "-t", "tcp") //#nosec G204
 		cmdSys.Stderr = io.Discard
 		outSys, errSys := cmdSys.Output()
 

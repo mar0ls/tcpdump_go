@@ -20,21 +20,39 @@ func dnsSummary(dns *layers.DNS, messageLength, verbosity int) string {
 	b.WriteString(dnsFlagMarkers(dns))
 
 	if !dns.QR {
-		b.WriteString(" ")
-		if dns.OpCode != layers.DNSOpCodeQuery {
-			fmt.Fprintf(&b, "%s ", dnsOpCodeName(dns.OpCode))
+		// Assembled as parts so a message with no question section does not
+		// leave the doubled separator an empty field would produce.
+		parts := make([]string, 0, 4)
+		if marker := dnsQuestionCount(dns); marker != "" {
+			parts = append(parts, marker)
 		}
-		b.WriteString(dnsQuestions(dns))
-		fmt.Fprintf(&b, " (%d)", messageLength)
+		if dns.OpCode != layers.DNSOpCodeQuery {
+			parts = append(parts, dnsOpCodeName(dns.OpCode))
+		}
+		if questions := dnsQuestions(dns, " "); questions != "" {
+			parts = append(parts, questions)
+		}
+		parts = append(parts, fmt.Sprintf("(%d)", messageLength))
+		fmt.Fprintf(&b, " %s", strings.Join(parts, " "))
 		return b.String()
 	}
 
 	if dns.ResponseCode != layers.DNSResponseCodeNoErr {
 		fmt.Fprintf(&b, " %s", dnsResponseCodeName(dns.ResponseCode))
 	}
-	// From -vv on, tcpdump echoes the question section back.
-	if verbosity > 1 && len(dns.Questions) > 0 {
-		fmt.Fprintf(&b, " q: %s", dnsQuestions(dns))
+	// From -vv on, tcpdump echoes the question section back. Without the echo
+	// the count marker is all that is left of the section, and tcpdump closes
+	// it with a comma.
+	echoQuestions := verbosity > 1 && len(dns.Questions) > 0
+	if marker := dnsQuestionCount(dns); marker != "" {
+		if echoQuestions {
+			fmt.Fprintf(&b, " %s", marker)
+		} else {
+			fmt.Fprintf(&b, " %s,", marker)
+		}
+	}
+	if echoQuestions {
+		fmt.Fprintf(&b, " %s", dnsEchoedQuestions(dns))
 	}
 	fmt.Fprintf(&b, " %d/%d/%d", dns.ANCount, dns.NSCount, dns.ARCount)
 	if records := dnsRecords(dns.Answers, verbosity); records != "" {
@@ -62,10 +80,31 @@ func dnsFlagMarkers(dns *layers.DNS) string {
 	return markers
 }
 
-func dnsQuestions(dns *layers.DNS) string {
+// dnsQuestionCount is tcpdump's "[Nq]" marker, shown whenever the header
+// claims anything other than the single question an ordinary message carries.
+func dnsQuestionCount(dns *layers.DNS) string {
+	if dns.QDCount == 1 {
+		return ""
+	}
+	return fmt.Sprintf("[%dq]", dns.QDCount)
+}
+
+// dnsQuestions renders a query's question section. tcpdump separates the
+// entries with a space there, unlike the echoed section in a response.
+func dnsQuestions(dns *layers.DNS, separator string) string {
 	parts := make([]string, 0, len(dns.Questions))
 	for _, question := range dns.Questions {
 		parts = append(parts, fmt.Sprintf("%s? %s.", question.Type, question.Name))
+	}
+	return strings.Join(parts, separator)
+}
+
+// dnsEchoedQuestions renders the question section a response carries back,
+// where tcpdump repeats the "q:" tag for every entry.
+func dnsEchoedQuestions(dns *layers.DNS) string {
+	parts := make([]string, 0, len(dns.Questions))
+	for _, question := range dns.Questions {
+		parts = append(parts, fmt.Sprintf("q: %s? %s.", question.Type, question.Name))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -218,8 +257,24 @@ func isPrintableASCII(s string) bool {
 
 // applicationSummary returns the application-layer text for a TCP segment, or
 // "" when no printer matches.
-func applicationSummary(packet gopacket.Packet, srcPort, dstPort uint16, payload []byte, verbosity int) string {
+// reportedLength is the length the transport header claims, which is what
+// tcpdump prints; it can exceed the bytes a short snap length left behind.
+// udp distinguishes the datagram printers from the stream ones: tcpdump reaches
+// its NTP printer only over UDP, and its DNS-over-TCP handling is a different
+// thing entirely from the datagram case.
+func applicationSummary(packet gopacket.Packet, srcPort, dstPort uint16, payload []byte, reportedLength, verbosity int, udp bool) string {
+	// NTP is handled before the empty-payload check because tcpdump still
+	// prints a marker for a datagram that carries nothing.
+	if udp && (ntpPorts[srcPort] || ntpPorts[dstPort]) {
+		return ntpSummary(payload, reportedLength, verbosity)
+	}
 	if len(payload) == 0 {
+		// A datagram too short to hold a DNS header is reported by length.
+		// gopacket yields neither a layer nor an error for an empty one, so
+		// the generic decoder-failure path never sees it.
+		if udp && (srcPort == 53 || dstPort == 53) {
+			return fmt.Sprintf("domain [length 0 < %d] (invalid)", dnsHeaderSize)
+		}
 		return ""
 	}
 	if srcPort == 53 || dstPort == 53 {

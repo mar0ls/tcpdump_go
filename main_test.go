@@ -122,6 +122,32 @@ func TestImmediateModeDefaultsOnAndCanBeDisabled(t *testing.T) {
 	}
 }
 
+func TestSilentRawCaptureBuffersForThroughput(t *testing.T) {
+	cases := []struct {
+		name         string
+		args         []string
+		printPackets bool
+		want         bool
+	}{
+		{"write only", []string{"-i", "lo0", "-w", "out.pcap"}, false, true},
+		{"printing as well", []string{"-i", "lo0", "-w", "out.pcap", "--print"}, true, false},
+		{"no output file", []string{"-i", "lo0"}, true, false},
+		{"-U keeps the file current", []string{"-i", "lo0", "-w", "out.pcap", "-U"}, false, false},
+		{"explicit flag wins", []string{"-i", "lo0", "-w", "out.pcap", "--immediate-mode=true"}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			options, err := parseOptions(tc.args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := bufferForThroughput(options, tc.printPackets); got != tc.want {
+				t.Fatalf("bufferForThroughput = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // -Z gives away exactly the privileges the offload restore needs, so the two
 // must not be accepted together.
 func TestDropPrivilegesRejectsDisableOffload(t *testing.T) {
@@ -177,7 +203,9 @@ func TestParseOptionsUsesPositionalAndFilterFileBPF(t *testing.T) {
 func TestRunOfflinePresentationAndFilter(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := run([]string{"-r", testFixturePath, "-n", "-t", "tcp"}, stdout, stderr); err != nil {
+	// -nn, because this is about the filter and not about port rendering:
+	// with a single -n tcpdump still resolves service names.
+	if err := run([]string{"-r", testFixturePath, "-nn", "-t", "tcp"}, stdout, stderr); err != nil {
 		t.Fatal(err)
 	}
 	output := stdout.String()
@@ -196,6 +224,37 @@ func TestRunOfflinePresentationAndFilter(t *testing.T) {
 	// tcpdump's quick mode abbreviates TCP but keeps UDP's full wording.
 	if !strings.Contains(stdout.String(), "tcp 5") || !strings.Contains(stdout.String(), "UDP, length") {
 		t.Fatalf("-q is incorrectly silent: %q", stdout.String())
+	}
+}
+
+// tcpdump counts -n rather than treating it as a switch: one occurrence stops
+// host lookups, and only a second one leaves service names alone. Apple's fork
+// suppresses both with a single -n, which is what this used to follow.
+func TestNameResolutionFlagsAreCounted(t *testing.T) {
+	// The named form needs a service database; "http" is in every one of them,
+	// unlike the fixture's ephemeral source port.
+	if _, err := os.Stat("/etc/services"); err != nil {
+		t.Skip("no service database to resolve port names against")
+	}
+	cases := []struct {
+		name      string
+		args      []string
+		wantPorts string
+	}{
+		{"-n keeps service names", []string{"-r", testFixturePath, "-n", "-t"}, "8.8.8.8.http"},
+		{"-nn leaves ports numeric", []string{"-r", testFixturePath, "-nn", "-t"}, "8.8.8.8.80"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout := &bytes.Buffer{}
+			stderr := &bytes.Buffer{}
+			if err := run(tc.args, stdout, stderr); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(stdout.String(), tc.wantPorts) {
+				t.Fatalf("output %q does not contain %q", stdout.String(), tc.wantPorts)
+			}
+		})
 	}
 }
 

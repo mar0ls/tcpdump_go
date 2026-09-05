@@ -99,6 +99,7 @@ func runReadPcap(options cliOptions, viewMode display.ViewMode, tsMode display.T
 	statistics := stats.NewStats()
 	flows := make(map[flowKey]uint64)
 	decodeOptions := gopacket.DecodeOptions{Lazy: true, NoCopy: true}
+	decodePackets := printPackets || options.showStats || options.csvOut != ""
 	var (
 		recordNumber uint64
 		packetNumber uint64
@@ -135,18 +136,25 @@ func runReadPcap(options cliOptions, viewMode display.ViewMode, tsMode display.T
 		}
 
 		packetNumber++
-		packet := gopacket.NewPacket(data, linkType, decodeOptions)
-		metadata := packet.Metadata()
-		metadata.CaptureInfo = captureInfo
-		metadata.Truncated = metadata.Truncated || captureInfo.CaptureLength < captureInfo.Length
+		// Building and decoding a packet is the most expensive work here, so
+		// -r with -w and nothing else skips it entirely.
+		if decodePackets {
+			packet := gopacket.NewPacket(data, linkType, decodeOptions)
+			metadata := packet.Metadata()
+			metadata.CaptureInfo = captureInfo
+			metadata.Truncated = metadata.Truncated || captureInfo.CaptureLength < captureInfo.Length
 
-		if printPackets {
-			if err := display.PrintPacket(packetNumber, packet, captureInfo.Timestamp, previousTS, viewMode, tsMode, options.verbosity, options.disableDNS); err != nil {
-				return fmt.Errorf("print packet %d: %w", packetNumber, err)
+			if printPackets {
+				if err := display.PrintPacket(packetNumber, packet, captureInfo.Timestamp, previousTS, viewMode, tsMode, options.verbosity, options.disableDNS); err != nil {
+					return fmt.Errorf("print packet %d: %w", packetNumber, err)
+				}
+			}
+			previousTS = captureInfo.Timestamp
+			statistics.Update(packet)
+			if options.csvOut != "" {
+				updateFlowMap(flows, packet)
 			}
 		}
-		previousTS = captureInfo.Timestamp
-		statistics.Update(packet)
 
 		if options.outPcap != "" {
 			if err := rawOutput.WritePacket(captureInfo, data, linkType, snaplen); err != nil {
@@ -161,9 +169,6 @@ func runReadPcap(options cliOptions, viewMode display.ViewMode, tsMode display.T
 					return fmt.Errorf("flush packet %d: %w", packetNumber, err)
 				}
 			}
-		}
-		if options.csvOut != "" {
-			updateFlowMap(flows, packet)
 		}
 		if options.count > 0 && packetNumber >= options.count {
 			break
