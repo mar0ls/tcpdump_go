@@ -372,6 +372,36 @@ func TestPrintNormal_ARP_Output(t *testing.T) {
 	}
 }
 
+// tcpdump reports the length of the link-layer payload it was handed, padding
+// included, so an Ethernet-minimum ARP frame prints 46 where the ARP PDU alone
+// is 28. Both directions are pinned here because only the padded case is what
+// a real capture normally holds.
+func TestPrintNormal_ARP_LengthMatchesTcpdump(t *testing.T) {
+	padded := buildARPPacket("10.0.0.1", "10.0.0.2", "aa:bb:cc:dd:ee:ff")
+	if len(padded) != 60 {
+		t.Fatalf("fixture frame is %d bytes, want the padded 60", len(padded))
+	}
+	cases := []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{"padded to the Ethernet minimum", padded, "length 46"},
+		{"no padding", padded[:42], "length 28"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := CaptureOut()
+			defer restore()
+			mustWrite(t, PrintNormal(1, decode(tc.raw), "10:00:00.000000", true))
+			mustWrite(t, FlushOut())
+			if out := buf.String(); !strings.Contains(out, tc.want) {
+				t.Errorf("ARP line %q does not contain %q", out, tc.want)
+			}
+		})
+	}
+}
+
 func TestPrintVerbose_TCP_ShowsIPMeta(t *testing.T) {
 	buf, restore := CaptureOut()
 	defer restore()

@@ -33,7 +33,7 @@ Presentation:
   -S                 absolute TCP sequence numbers
   -# / --number      print packet numbers
   -t/-tt/-ttt/-tttt  timestamp modes
-  -n/-nn             disable name resolution
+  -n                 do not resolve host names; -nn also leaves ports numeric
   -f                 print foreign addresses numerically
   -l                 flush text output after every packet
 
@@ -42,7 +42,7 @@ Capture and extensions:
   -B N               kernel buffer in KiB
   -p                 disable promiscuous mode
   -Z user            drop privileges to user once the source is open
-  --immediate-mode   deliver packets as they arrive (default; =false buffers)
+  --immediate-mode   deliver packets as they arrive; off for silent -w
   --disable-offload  temporarily disable and restore Linux NIC offloads
   --stats            extended session statistics
   --stats-only       statistics without packet lines
@@ -590,7 +590,7 @@ golang.org/x/text v0.37.0
 
 | Metric | Value |
 |--------|-------|
-| .go files | 39 |
-| Total lines | 8943 |
-| Code lines | 7658 |
-| Comment lines | 560 |
+| .go files | 44 |
+| Total lines | 10654 |
+| Code lines | 9031 |
+| Comment lines | 790 |

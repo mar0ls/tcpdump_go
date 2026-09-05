@@ -31,6 +31,75 @@ func TestFormatTSHandlesNegativeAndLocalTime(t *testing.T) {
 	}
 }
 
+// tcpdump marks any question count other than one with "[Nq]". The exact
+// spellings below were taken from tcpdump 4.99.1 on the same fixtures: a query
+// separates its questions with a space, a response repeats the "q:" tag and
+// separates with a comma, and a response that does not echo the section closes
+// the marker with a comma instead.
+func TestDNSQuestionCountMatchesTcpdump(t *testing.T) {
+	question := func(name string) layers.DNSQuestion {
+		return layers.DNSQuestion{Name: []byte(name), Type: layers.DNSTypeA, Class: layers.DNSClassIN}
+	}
+	answer := layers.DNSResourceRecord{
+		Name: []byte("example.com"), Type: layers.DNSTypeA,
+		Class: layers.DNSClassIN, TTL: 300, IP: net.IP{1, 2, 3, 4},
+	}
+	cases := []struct {
+		name      string
+		dns       *layers.DNS
+		length    int
+		verbosity int
+		want      string
+	}{
+		{
+			name:   "query with the usual single question",
+			dns:    &layers.DNS{ID: 100, RD: true, QDCount: 1, Questions: []layers.DNSQuestion{question("example.com")}},
+			length: 29,
+			want:   "100+ A? example.com. (29)",
+		},
+		{
+			name:   "query with no question section",
+			dns:    &layers.DNS{ID: 101, RD: true},
+			length: 12,
+			want:   "101+ [0q] (12)",
+		},
+		{
+			name:   "query with two questions is space separated",
+			dns:    &layers.DNS{ID: 102, RD: true, QDCount: 2, Questions: []layers.DNSQuestion{question("a.example.com"), question("b.example.com")}},
+			length: 50,
+			want:   "102+ [2q] A? a.example.com. A? b.example.com. (50)",
+		},
+		{
+			name: "response without the echoed section closes the marker with a comma",
+			dns: &layers.DNS{
+				ID: 104, QR: true, RD: true, RA: true, QDCount: 2, ANCount: 1,
+				Questions: []layers.DNSQuestion{question("a.example.com"), question("b.example.com")},
+				Answers:   []layers.DNSResourceRecord{answer},
+			},
+			length: 77,
+			want:   "104 [2q], 1/0/0 A 1.2.3.4 (77)",
+		},
+		{
+			name: "response echoing the section repeats the q: tag",
+			dns: &layers.DNS{
+				ID: 104, QR: true, RD: true, RA: true, QDCount: 2, ANCount: 1,
+				Questions: []layers.DNSQuestion{question("a.example.com"), question("b.example.com")},
+				Answers:   []layers.DNSResourceRecord{answer},
+			},
+			length:    77,
+			verbosity: 2,
+			want:      "104 [2q] q: A? a.example.com., q: A? b.example.com. 1/0/0 example.com. A 1.2.3.4 (77)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dnsSummary(tc.dns, tc.length, tc.verbosity); got != tc.want {
+				t.Fatalf("dnsSummary =\n  %q\nwant\n  %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestTruncatedTCPPrintsMarkerWithoutFabricatedFields(t *testing.T) {
 	raw := buildTCPPacket("192.0.2.1", "198.51.100.2", 12345, 80, false, true)
 	raw = raw[:14+20+10]

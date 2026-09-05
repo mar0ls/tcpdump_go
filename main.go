@@ -47,6 +47,9 @@ type cliOptions struct {
 	disableOffload  bool
 	dropUser        string
 	noImmediateMode bool
+	// immediateModeExplicit records that --immediate-mode was actually given,
+	// so the raw-write default below never overrides a deliberate choice.
+	immediateModeExplicit bool
 
 	verbosity    int
 	hex          bool
@@ -171,6 +174,19 @@ func main() {
 	}
 }
 
+// bufferForThroughput reports whether libpcap should fill its buffer rather
+// than wake this process per packet. Immediate delivery earns that wakeup when
+// someone is watching the output; a -w capture that prints nothing is
+// throughput work, and tcpdump does not ask for immediate delivery there
+// either. -U wants the file current, so it keeps per-packet delivery, and an
+// explicit --immediate-mode always wins.
+func bufferForThroughput(options cliOptions, printPackets bool) bool {
+	return !options.immediateModeExplicit &&
+		!printPackets &&
+		options.outPcap != "" &&
+		!options.packetBuffered
+}
+
 func run(args []string, stdout, stderr io.Writer) (retErr error) {
 	options, err := parseOptions(args, stderr)
 	if errors.Is(err, flag.ErrHelp) {
@@ -207,6 +223,9 @@ func run(args []string, stdout, stderr io.Writer) (retErr error) {
 	if options.statsOnly || options.countOnly {
 		printPackets = false
 	}
+	if bufferForThroughput(options, printPackets) {
+		options.noImmediateMode = true
+	}
 	textOutput := stdout
 	if options.outPcap == "-" || (options.outPcap != "" && !printPackets) {
 		textOutput = stderr
@@ -221,7 +240,9 @@ func run(args []string, stdout, stderr io.Writer) (retErr error) {
 		LinkHeader:              options.linkHeader,
 		ShowPacketNumber:        options.number,
 		AbsoluteSequenceNumbers: options.absSeq,
-		NumericPorts:            options.disableDNS,
+		// tcpdump counts this flag: -n stops at host names and only -nn also
+		// leaves the service names alone.
+		NumericPorts: options.disableDNSAll,
 	})
 	defer display.ResetRenderer()
 
@@ -284,7 +305,7 @@ func parseOptions(args []string, stderr io.Writer) (cliOptions, error) {
 	fs.BoolVar(&options.disableOffload, "disable-offload", false, "temporarily disable and later restore NIC offloads (Linux)")
 	fs.StringVar(&options.dropUser, "Z", "", "drop privileges to this user after opening the capture source")
 	immediateMode := true
-	fs.BoolVar(&immediateMode, "immediate-mode", true, "deliver packets as they arrive; --immediate-mode=false buffers for throughput")
+	fs.BoolVar(&immediateMode, "immediate-mode", true, "deliver packets as they arrive; off by default for -w without printing")
 
 	fs.Var((*verbosityCounter)(&options.verbosity), "v", "verbose packet details; repeat for more (-vv, -vvv)")
 	fs.BoolVar(&options.hex, "x", false, "hex dump without link header")
@@ -320,6 +341,11 @@ func parseOptions(args []string, stderr io.Writer) (cliOptions, error) {
 		return cliOptions{}, err
 	}
 	options.noImmediateMode = !immediateMode
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "immediate-mode" {
+			options.immediateModeExplicit = true
+		}
+	})
 	positional := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if positional != "" && options.filter != "" {
 		return cliOptions{}, errors.New("use either a positional BPF expression or --filter, not both")
@@ -541,7 +567,7 @@ Presentation:
   -S                 absolute TCP sequence numbers
   -# / --number      print packet numbers
   -t/-tt/-ttt/-tttt  timestamp modes
-  -n/-nn             disable name resolution
+  -n                 do not resolve host names; -nn also leaves ports numeric
   -f                 print foreign addresses numerically
   -l                 flush text output after every packet
 
@@ -550,7 +576,7 @@ Capture and extensions:
   -B N               kernel buffer in KiB
   -p                 disable promiscuous mode
   -Z user            drop privileges to user once the source is open
-  --immediate-mode   deliver packets as they arrive (default; =false buffers)
+  --immediate-mode   deliver packets as they arrive; off for silent -w
   --disable-offload  temporarily disable and restore Linux NIC offloads
   --stats            extended session statistics
   --stats-only       statistics without packet lines
